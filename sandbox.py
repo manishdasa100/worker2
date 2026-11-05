@@ -65,6 +65,7 @@ class SandboxResult:
     signal: Optional[int]
     peak_memory_mb: int = 0
     setup_failed: bool = False   # nsjail couldn't start the command: a worker failure, not a verdict
+    output_exceeded: bool = False  # stdout passed the output cap; the jail was killed for it
     # Raw components (CALIBRATE reports all of them)
     wall_ms: int = 0
     wrapper_ms: Optional[int] = None
@@ -77,7 +78,7 @@ class SandboxResult:
 
 
 class NsjailSandbox:
-    def __init__(self, config: SandboxConfig, delegation: CgroupDelegation):
+    def __init__(self, config: SandboxConfig, delegation: CgroupDelegation, output_limit_bytes: int):
         if delegation is None:
             raise ValueError(
                 "NsjailSandbox requires a delegated cgroup subtree — run under "
@@ -85,6 +86,7 @@ class NsjailSandbox:
             )
         self.config = config
         self.delegation = delegation
+        self.output_limit_bytes = output_limit_bytes
         self._time_wrapper = os.path.isfile(TIME_BINARY)
         if not self._time_wrapper:
             logger.warning("%s not found — runtimes will include sandbox overhead "
@@ -197,6 +199,16 @@ class NsjailSandbox:
         )
         logger.debug("nsjail: %s", " ".join(nsjail_cmd))
 
+        output_exceeded = False
+
+        def kill_for_output():
+            nonlocal output_exceeded
+            output_exceeded = True
+            try:
+                run_cgroup.kill()
+            except OSError:
+                process.kill()   # no cgroup.kill: take nsjail down, the jail with it
+
         start = time.monotonic()
         try:
             process = await asyncio.create_subprocess_exec(
@@ -208,8 +220,16 @@ class NsjailSandbox:
             # Outer timeout sits above the enforced wall backstop; if it fires
             # nsjail itself hung.
             outer = wall_limit_s + 10
-            stdout_b, stderr_b = await asyncio.wait_for(
-                process.communicate(input=stdin_data.encode("utf-8")), timeout=outer)
+            # Never buffer more than the cap: in the run phase stdout past it kills
+            # the jail (Output Limit Exceeded); stderr, and compiler output, are
+            # truncated but never fatal. Both pipes are read to EOF so the program
+            # can't block on a full pipe.
+            cap = self.output_limit_bytes
+            stdout_b, stderr_b, _, _ = await asyncio.wait_for(asyncio.gather(
+                self._drain(process.stdout, cap, kill_for_output if measure else None),
+                self._drain(process.stderr, cap),
+                self._feed(process.stdin, stdin_data.encode("utf-8")),
+                process.wait()), timeout=outer)
             elapsed_ms = int((time.monotonic() - start) * 1000)
 
             with open(log_path, "r", errors="replace") as f:
@@ -265,7 +285,7 @@ class NsjailSandbox:
                 timed_out=timed_out, oom_killed=oom_killed, runtime_ms=runtime_ms,
                 signal=signal, peak_memory_mb=peak_memory_mb, wall_ms=elapsed_ms,
                 wrapper_ms=wrapper_ms, driver_ms=driver_ms, cpu_ms=cpu_ms,
-                setup_failed=setup_failed,
+                setup_failed=setup_failed, output_exceeded=output_exceeded,
             )
 
         except asyncio.TimeoutError:
@@ -292,6 +312,26 @@ class NsjailSandbox:
                 shutil.rmtree(stats_dir, ignore_errors=True)
             if run_cgroup is not None:
                 run_cgroup.remove()
+
+    @staticmethod
+    async def _drain(stream, cap: int, on_overflow=None) -> bytes:
+        """Read a pipe to EOF, keeping only its first `cap` bytes."""
+        kept = bytearray()
+        while chunk := await stream.read(65536):
+            if on_overflow and len(kept) + len(chunk) > cap:
+                on_overflow()
+                on_overflow = None
+            kept += chunk[:cap - len(kept)]
+        return bytes(kept)
+
+    @staticmethod
+    async def _feed(stdin, data: bytes) -> None:
+        try:
+            stdin.write(data)
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # the program exited without reading all its input
+        stdin.close()
 
     @staticmethod
     def _read_stats(stats_path: str):

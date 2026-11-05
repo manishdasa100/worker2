@@ -100,6 +100,11 @@ class RunCgroup:
                 return parts[1] != "0"
         return False
 
+    def kill(self) -> None:
+        """SIGKILL every process in the run's subtree (the jail, not nsjail itself)."""
+        with open(os.path.join(self.path, "cgroup.kill"), "w") as f:
+            f.write("1")
+
     def remove(self) -> None:
         """
         Remove the run cgroup, including any nested NSJAIL.* child left

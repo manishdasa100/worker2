@@ -57,7 +57,7 @@ class CompileOutcome:
 class Judge:
     def __init__(self, config: WorkerConfig, delegation: CgroupDelegation):
         self.config = config
-        self.sandbox = NsjailSandbox(config.sandbox, delegation)
+        self.sandbox = NsjailSandbox(config.sandbox, delegation, config.execution.max_output_bytes)
 
     # ---- warmup -------------------------------------------------------------
 
@@ -226,6 +226,10 @@ class Judge:
         partial_stdout = sandbox_result.stdout[:cap]
         partial_stderr = (sandbox_result.stderr or "")[:cap]
 
+        if sandbox_result.output_exceeded:
+            return TestCaseResult(index, TestStatus.OUTPUT_LIMIT, input_data, expected_output,
+                                  runtime_ms=sandbox_result.runtime_ms, memory_mb=sandbox_result.peak_memory_mb)
+
         if sandbox_result.timed_out:
             return TestCaseResult(index, TestStatus.TIMEOUT, input_data, expected_output,
                                   std_output=partial_stdout, stderr=partial_stderr,
@@ -258,10 +262,6 @@ class Judge:
                                   runtime_ms=sandbox_result.runtime_ms, memory_mb=sandbox_result.peak_memory_mb)
 
         stdout = sandbox_result.stdout
-        if len(stdout.encode("utf-8")) > cap:
-            return TestCaseResult(index, TestStatus.OUTPUT_LIMIT, input_data, expected_output,
-                                  runtime_ms=sandbox_result.runtime_ms, memory_mb=sandbox_result.peak_memory_mb)
-
         # Answer = last non-empty line; everything before it is debug output.
         non_empty = [ln for ln in stdout.rstrip("\n").split("\n") if ln.strip()]
         if not non_empty:

@@ -8,6 +8,7 @@ import asyncio
 import os
 import sys
 import time
+import tracemalloc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -106,7 +107,44 @@ async def main():
     failures += 0 if kept else 1
     print(f"{'PASS' if kept else 'FAIL'} {'tle-keeps-output':16s} -> retained: {bool(kept)}")
 
-    total = len(CASES) + 2
+    # D2: a stdout flood is cut off at the output cap, promptly, without the
+    # worker buffering it; stdout just under the cap is judged normally.
+    cap = config.execution.max_output_bytes
+    tracemalloc.start()
+    t0 = time.monotonic()
+    report = await judge.judge(ExecutionRequest(
+        job_id="stdout-flood", language="python",
+        user_code="def f():\n    while True: print('x' * 65536)\n", driver_code=PY_DRV,
+        task="SUBMIT_CODE", time_limit=1000, memory_limit=64, test_cases=[EXPECTED]))
+    wall = time.monotonic() - t0
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    ok = report.status_code == "OLE" and wall < 1 and peak < 4 * cap
+    failures += 0 if ok else 1
+    print(f"{'PASS' if ok else 'FAIL'} {'stdout-flood-ole':16s} -> {report.status_code:3s} (want OLE) "
+          f"wall={wall:4.1f}s (<1s) worker-peak={peak // 1024}KB (<{4 * cap // 1024}KB)")
+
+    report = await judge.judge(ExecutionRequest(
+        job_id="stdout-under-cap", language="python",
+        user_code=f"def f():\n    print('x' * {cap - 100})\n    return 42\n", driver_code=PY_DRV,
+        task="SUBMIT_CODE", time_limit=2000, memory_limit=64, test_cases=[EXPECTED]))
+    ok = report.status_code == "ACC"; failures += 0 if ok else 1
+    print(f"{'PASS' if ok else 'FAIL'} {'stdout-under-cap':16s} -> {report.status_code:3s} (want ACC)")
+
+    # stderr is capped separately and never ends a run: the flood finishes and
+    # the program's own exit code is reported, with stderr truncated to the cap.
+    report = await judge.judge(ExecutionRequest(
+        job_id="stderr-flood", language="python",
+        user_code="import sys\ndef f():\n    for _ in range(64): sys.stderr.write('e' * 65536)\n    sys.exit(3)\n",
+        driver_code=PY_DRV, task="SUBMIT_CODE", time_limit=2000, memory_limit=64, test_cases=[EXPECTED]))
+    stderr_len = len(report.failed_testcase.stderr or "") if report.failed_testcase else -1
+    ok = (report.status_code == "RE" and "exit code 3" in (report.runtime_error or "")
+          and 0 < stderr_len <= cap)
+    failures += 0 if ok else 1
+    print(f"{'PASS' if ok else 'FAIL'} {'stderr-flood-re':16s} -> {report.status_code:3s} (want RE) "
+          f"stderr={stderr_len}B (<={cap}B)")
+
+    total = len(CASES) + 5
     print(f"\n{total - failures}/{total} passed")
     sys.exit(1 if failures else 0)
 
