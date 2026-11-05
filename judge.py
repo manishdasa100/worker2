@@ -111,6 +111,9 @@ class Judge:
         )
         compile_ms = int((time.monotonic() - started) * 1000)
 
+        if sr.setup_failed:
+            raise RuntimeError(f"Jail failed to launch the compiler (exit={sr.exit_code}): "
+                               f"{sr.nsjail_log[-500:]}")
         if sr.timed_out:
             return CompileOutcome(False, "Compilation timed out", compile_ms)
         if sr.oom_killed:
@@ -234,20 +237,22 @@ class Judge:
                                   std_output=partial_stdout, stderr=partial_stderr,
                                   runtime_ms=sandbox_result.runtime_ms, memory_mb=sandbox_result.peak_memory_mb)
 
+        if sandbox_result.setup_failed:
+            logger.error("Jail failed to execute (exit=%d) stderr=%r log=%r", sandbox_result.exit_code,
+                         partial_stderr, sandbox_result.nsjail_log)
+            return TestCaseResult(index, TestStatus.ERROR, input_data, expected_output,
+                                  stderr=partial_stderr, error_message="Sandbox failed to execute",
+                                  runtime_ms=sandbox_result.runtime_ms)
+
         if sandbox_result.exit_code != 0:
             stderr = sandbox_result.stderr.strip() if sandbox_result.stderr else ""
-            if sandbox_result.exit_code in (-1, 255):
-                logger.error("Sandbox failed to execute (exit=%d) stderr=%r log=%r",
-                             sandbox_result.exit_code, stderr, sandbox_result.nsjail_log)
-                return TestCaseResult(index, TestStatus.ERROR, input_data, expected_output,
-                                      stderr=stderr, error_message="Sandbox failed to execute",
-                                      runtime_ms=sandbox_result.runtime_ms)
             if sandbox_result.signal:
                 names = {9: "SIGKILL", 11: "SIGSEGV (Segmentation fault)",
-                         6: "SIGABRT", 8: "SIGFPE (Floating point exception)"}
+                         6: "SIGABRT", 8: "SIGFPE (Floating point exception)",
+                         31: "SIGSYS (forbidden syscall)"}
                 error_msg = f"Process killed by {names.get(sandbox_result.signal, f'Signal {sandbox_result.signal}')}"
             else:
-                error_msg = stderr or "Runtime error. Check stderr."
+                error_msg = f"Runtime error (exit code {sandbox_result.exit_code})" + (f"\n{stderr}" if stderr else "")
             return TestCaseResult(index, TestStatus.RUNTIME_ERROR, input_data, expected_output,
                                   std_output=sandbox_result.stdout, stderr=stderr, error_message=error_msg,
                                   runtime_ms=sandbox_result.runtime_ms, memory_mb=sandbox_result.peak_memory_mb)

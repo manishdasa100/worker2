@@ -23,6 +23,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -43,6 +44,13 @@ STATS_FILENAME = "stats.txt"
 SIGKILL = 9
 SIGXCPU = 24
 
+# nsjail's reap line for the jail's direct child (the program, or GNU time
+# around it). Absent, or with a launch failure logged, means nsjail itself
+# never got the command running: a setup failure, not the program's doing.
+_NSJAIL_EXIT = re.compile(r"\) (?:exited with status: \d+|terminated with signal: \S+ \((\d+)\))")
+_NSJAIL_LAUNCH_FAILED = "Launching child process failed"
+_TIME_CANNOT_RUN = f"{TIME_BINARY}: cannot run "
+
 
 @dataclass
 class SandboxResult:
@@ -56,6 +64,7 @@ class SandboxResult:
     runtime_ms: int              # resolved: driver > wrapper > wall
     signal: Optional[int]
     peak_memory_mb: int = 0
+    setup_failed: bool = False   # nsjail couldn't start the command: a worker failure, not a verdict
     # Raw components (CALIBRATE reports all of them)
     wall_ms: int = 0
     wrapper_ms: Optional[int] = None
@@ -209,7 +218,19 @@ class NsjailSandbox:
             stdout = stdout_b.decode("utf-8", errors="replace")
             stderr = stderr_b.decode("utf-8", errors="replace")
             exit_code = process.returncode or 0
-            signal = exit_code - 128 if exit_code > 128 else None
+            driver_ms, wrapper_ms, wrapped_signal = self._read_stats(stats_path)
+            exits = list(_NSJAIL_EXIT.finditer(nsjail_log))
+            # ponytail: user code can forge GNU time's lines — print the "cannot run"
+            # stderr line and exit 127 (its own job becomes a worker failure), or write
+            # a "Command terminated by signal" line to /stats (its own RE reason
+            # changes). Self-only; both go with the GNU time wrapper.
+            setup_failed = (not exits or _NSJAIL_LAUNCH_FAILED in nsjail_log
+                            or (bool(stats_path) and exit_code == 127
+                                and stderr.startswith(_TIME_CANNOT_RUN)))
+            # Signal never comes from exit_code (a program may exit 139 itself):
+            # the jail child's signal per nsjail, else the program's per GNU time.
+            jail_signal = exits[-1].group(1) if exits else None
+            signal = int(jail_signal) if jail_signal else wrapped_signal
 
             # Kernel counters — definitive, survive a SIGKILLed PID namespace.
             oom_killed = run_cgroup.oom_killed()
@@ -232,7 +253,6 @@ class NsjailSandbox:
                 or (signal == SIGKILL and elapsed_ms >= wall_limit_s * 1000)
             )
 
-            driver_ms, wrapper_ms = self._read_stats(stats_path)
             if driver_ms is not None and 0 <= driver_ms <= elapsed_ms:
                 runtime_ms = driver_ms
             elif wrapper_ms is not None:
@@ -245,6 +265,7 @@ class NsjailSandbox:
                 timed_out=timed_out, oom_killed=oom_killed, runtime_ms=runtime_ms,
                 signal=signal, peak_memory_mb=peak_memory_mb, wall_ms=elapsed_ms,
                 wrapper_ms=wrapper_ms, driver_ms=driver_ms, cpu_ms=cpu_ms,
+                setup_failed=setup_failed,
             )
 
         except asyncio.TimeoutError:
@@ -256,12 +277,12 @@ class NsjailSandbox:
             except Exception:
                 pass
             return SandboxResult("", "Sandbox process timed out (nsjail hung)", "", -1,
-                                 False, False, elapsed_ms, None)
+                                 False, False, elapsed_ms, None, setup_failed=True)
         except (FileNotFoundError, PermissionError, OSError) as e:
             elapsed_ms = int((time.monotonic() - start) * 1000)
             logger.error("Failed to launch nsjail: %s", e)
             return SandboxResult("", f"Failed to launch sandbox: {e}", "", -1,
-                                 False, False, elapsed_ms, None)
+                                 False, False, elapsed_ms, None, setup_failed=True)
         finally:
             try:
                 os.unlink(log_path)
@@ -277,24 +298,27 @@ class NsjailSandbox:
         """
         Parse the shared stats file. Lines in write order:
             driver_ns <int>   optional, appended by driver: solution call ns
+            Command terminated by signal <n>   GNU time, if the program was signalled
             <%e seconds>      GNU time, always last (unless the wrapper was killed)
-        Returns (driver_ms, wrapper_ms), each None if missing/unparseable.
+        Returns (driver_ms, wrapper_ms, signal), each None if missing/unparseable.
         """
-        driver_ms = wrapper_ms = None
+        driver_ms = wrapper_ms = signal = None
         if not stats_path:
-            return driver_ms, wrapper_ms
+            return driver_ms, wrapper_ms, signal
         try:
             with open(stats_path, "r") as f:
                 content = f.read()
         except OSError:
-            return driver_ms, wrapper_ms
+            return driver_ms, wrapper_ms, signal
         for line in content.splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0] == "driver_ns" and parts[1].isdigit():
                 driver_ms = (int(parts[1]) + 500_000) // 1_000_000   # last wins
+            elif line.startswith("Command terminated by signal ") and parts[-1].isdigit():
+                signal = int(parts[-1])
             elif len(parts) == 1:
                 try:
                     wrapper_ms = int(float(parts[0]) * 1000)
                 except ValueError:
                     continue
-        return driver_ms, wrapper_ms
+        return driver_ms, wrapper_ms, signal

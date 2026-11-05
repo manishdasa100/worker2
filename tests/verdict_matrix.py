@@ -14,13 +14,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cgroups import CgroupDelegation
 from config import load_config
 from judge import Judge
+from languages import LANGUAGES
+from languages.python import PythonLanguage
 from models import ExecutionRequest
 
 PY_DRV = "from solution import f\nprint(f())\n"
 CPP_DRV = '#include <iostream>\n#include "solution.cpp"\nint main(){ std::cout << f() << std::endl; }\n'
 JAVA_DRV = "public class Main { public static void main(String[] a){ System.out.println(Solution.f()); } }"
 
-# (name, lang, solution, driver, time_ms, mem_mb, expected)
+
+class UnlaunchableRun(PythonLanguage):
+    def run_command(self, memory_limit_mb):
+        return ["/nonexistent"]
+
+
+class UnlaunchableCompile(PythonLanguage):
+    def compile_command(self):
+        return ["/nonexistent"]
+
+
+# nsjail setup failures must stay worker failures (IE -> FAILED).
+LANGUAGES["broken-run"] = UnlaunchableRun()
+LANGUAGES["broken-compile"] = UnlaunchableCompile()
+
+# (name, lang, solution, driver, time_ms, mem_mb, expected[, runtime_error must contain])
 CASES = [
     ("java-64mb-ok", "java",
      "public class Solution { static long f(){ long s=0; int[][] a=new int[64][];"
@@ -38,7 +55,16 @@ CASES = [
     ("py-slow-acc", "python",
      "import time\ndef f():\n    t=time.process_time()\n    while time.process_time()-t<2.2: pass\n    return 42\n",
      PY_DRV, 1000, 64, "ACC"),   # 1000ms x3 python = 3000ms CPU budget; 2.2s passes
-    ("cpp-segv-re", "cpp", "long f(){ int* p=0; *p=1; return *p; }\n", CPP_DRV, 2000, 64, "RE"),
+    ("cpp-segv-re", "cpp", "long f(){ int* p=0; *p=1; return *p; }\n", CPP_DRV, 2000, 64, "RE", "SIGSEGV"),
+    # D1: a program's own exit code is never a worker failure nor a signal
+    ("py-exit255-re", "python", "import sys\ndef f():\n    sys.exit(255)\n", PY_DRV, 1000, 64, "RE", "exit code 255"),
+    ("py-stderr-exit-re", "python", "import sys\ndef f():\n    print('oops', file=sys.stderr)\n    sys.exit(3)\n",
+     PY_DRV, 1000, 64, "RE", "exit code 3"),
+    ("py-exit139-re", "python", "import sys\ndef f():\n    sys.exit(139)\n", PY_DRV, 1000, 64, "RE", "exit code 139"),
+    ("cpp-sigsys-re", "cpp", "#include <sched.h>\nlong f(){ unshare(0); return 42; }\n", CPP_DRV, 2000, 64,
+     "RE", "forbidden syscall"),
+    ("run-setup-ie", "broken-run", "def f():\n    return 42\n", PY_DRV, 1000, 64, "IE"),
+    ("compile-setup-ie", "broken-compile", "def f():\n    return 42\n", PY_DRV, 1000, 64, "IE"),
 ]
 EXPECTED = {"input": "", "expectedOutput": "42"}
 
@@ -52,15 +78,17 @@ async def main():
     await judge.warmup()
     failures = 0
 
-    for name, lang, sol, drv, tl, ml, want in CASES:
+    for name, lang, sol, drv, tl, ml, want, *must_say in CASES:
         t0 = time.monotonic()
         report = await judge.judge(ExecutionRequest(
             job_id=name, language=lang, user_code=sol, driver_code=drv,
             task="SUBMIT_CODE", time_limit=tl, memory_limit=ml, test_cases=[EXPECTED]))
-        ok = report.status_code == want
+        said = report.runtime_error or ""
+        ok = report.status_code == want and all(m in said for m in must_say)
         failures += 0 if ok else 1
         print(f"{'PASS' if ok else 'FAIL'} {name:16s} -> {report.status_code:3s} (want {want}) "
-              f"wall={time.monotonic()-t0:4.1f}s mem={report.memory_mb}MB")
+              f"wall={time.monotonic()-t0:4.1f}s mem={report.memory_mb}MB"
+              + (f" error={said[:60]!r}" if must_say else ""))
 
     # too many test cases -> IE
     report = await judge.judge(ExecutionRequest(
