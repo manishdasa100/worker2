@@ -41,6 +41,10 @@ TIME_BINARY = "/usr/bin/time"
 STATS_MOUNT = "/stats"
 STATS_FILENAME = "stats.txt"
 
+# stderr is debug output and never judged, so it may run far past the output
+# cap; only a flood this many times the cap kills the jail.
+STDERR_FLOOD_FACTOR = 64
+
 SIGKILL = 9
 SIGXCPU = 24
 
@@ -65,7 +69,7 @@ class SandboxResult:
     signal: Optional[int]
     peak_memory_mb: int = 0
     setup_failed: bool = False   # nsjail couldn't start the command: a worker failure, not a verdict
-    output_exceeded: bool = False  # stdout passed the output cap; the jail was killed for it
+    output_exceeded: bool = False  # stdout passed the output cap (or stderr flooded); the jail was killed for it
     # Raw components (CALIBRATE reports all of them)
     wall_ms: int = 0
     wrapper_ms: Optional[int] = None
@@ -220,14 +224,17 @@ class NsjailSandbox:
             # Outer timeout sits above the enforced wall backstop; if it fires
             # nsjail itself hung.
             outer = wall_limit_s + 10
-            # Never buffer more than the cap: in the run phase stdout past it kills
-            # the jail (Output Limit Exceeded); stderr, and compiler output, are
-            # truncated but never fatal. Both pipes are read to EOF so the program
-            # can't block on a full pipe.
+            # Never buffer more than the cap. In the run phase stdout past the cap,
+            # or a stderr flood, kills the jail (Output Limit Exceeded); stderr keeps
+            # its tail, where tracebacks and memory markers are. Compiler output keeps
+            # its head (the first error) and is never fatal. Both pipes are read to
+            # EOF so the program can't block on a full pipe.
             cap = self.output_limit_bytes
+            kill = kill_for_output if measure else None
             stdout_b, stderr_b, _, _ = await asyncio.wait_for(asyncio.gather(
-                self._drain(process.stdout, cap, kill_for_output if measure else None),
-                self._drain(process.stderr, cap),
+                self._drain(process.stdout, cap, kill_past=cap, kill=kill),
+                self._drain(process.stderr, cap, tail=measure,
+                            kill_past=cap * STDERR_FLOOD_FACTOR, kill=kill),
                 self._feed(process.stdin, stdin_data.encode("utf-8")),
                 process.wait()), timeout=outer)
             elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -314,15 +321,25 @@ class NsjailSandbox:
                 run_cgroup.remove()
 
     @staticmethod
-    async def _drain(stream, cap: int, on_overflow=None) -> bytes:
-        """Read a pipe to EOF, keeping only its first `cap` bytes."""
+    async def _drain(stream, cap: int, *, tail=False, kill_past=0, kill=None) -> bytes:
+        """
+        Read a pipe to EOF, keeping only its first (or, with tail, last) `cap`
+        bytes. Calls kill() once, as soon as more than kill_past bytes arrive.
+        """
         kept = bytearray()
+        total = 0
         while chunk := await stream.read(65536):
-            if on_overflow and len(kept) + len(chunk) > cap:
-                on_overflow()
-                on_overflow = None
-            kept += chunk[:cap - len(kept)]
-        return bytes(kept)
+            total += len(chunk)
+            if kill and total > kill_past:
+                kill()
+                kill = None
+            if tail:
+                kept += chunk
+                if len(kept) > 2 * cap:      # trim in batches, not per chunk
+                    del kept[:-cap]
+            else:
+                kept += chunk[:cap - len(kept)]
+        return bytes(kept[-cap:] if tail else kept)
 
     @staticmethod
     async def _feed(stdin, data: bytes) -> None:

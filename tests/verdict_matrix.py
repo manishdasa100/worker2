@@ -64,6 +64,10 @@ CASES = [
     ("py-exit139-re", "python", "import sys\ndef f():\n    sys.exit(139)\n", PY_DRV, 1000, 64, "RE", "exit code 139"),
     ("cpp-sigsys-re", "cpp", "#include <sched.h>\nlong f(){ unshare(0); return 42; }\n", CPP_DRV, 2000, 64,
      "RE", "forbidden syscall"),
+    # A runtime memory marker after a lot of stderr is still seen (stderr keeps its tail)
+    ("py-noisy-memerr-mle", "python",
+     "import sys\ndef f():\n    sys.stderr.write('e' * 300000 + '\\n')\n    x = 'x' * (10**12)\n    return 42\n",
+     PY_DRV, 1000, 64, "MLE"),
     ("run-setup-ie", "broken-run", "def f():\n    return 42\n", PY_DRV, 1000, 64, "IE"),
     ("compile-setup-ie", "broken-compile", "def f():\n    return 42\n", PY_DRV, 1000, 64, "IE"),
 ]
@@ -144,7 +148,18 @@ async def main():
     print(f"{'PASS' if ok else 'FAIL'} {'stderr-flood-re':16s} -> {report.status_code:3s} (want RE) "
           f"stderr={stderr_len}B (<={cap}B)")
 
-    total = len(CASES) + 5
+    # ...but a stderr flood (past 64x the cap) is cut off like a stdout one.
+    t0 = time.monotonic()
+    report = await judge.judge(ExecutionRequest(
+        job_id="stderr-flood-ole", language="python",
+        user_code="import sys\ndef f():\n    while True: sys.stderr.write('e' * 65536)\n", driver_code=PY_DRV,
+        task="SUBMIT_CODE", time_limit=1000, memory_limit=64, test_cases=[EXPECTED]))
+    wall = time.monotonic() - t0
+    ok = report.status_code == "OLE" and wall < 1
+    failures += 0 if ok else 1
+    print(f"{'PASS' if ok else 'FAIL'} {'stderr-flood-ole':16s} -> {report.status_code:3s} (want OLE) wall={wall:4.1f}s (<1s)")
+
+    total = len(CASES) + 6
     print(f"\n{total - failures}/{total} passed")
     sys.exit(1 if failures else 0)
 
