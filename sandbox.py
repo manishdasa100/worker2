@@ -43,7 +43,7 @@ STATS_FILENAME = "stats.txt"
 
 # stderr is debug output and never judged, so it may run far past the output
 # cap; only a flood this many times the cap kills the jail.
-STDERR_FLOOD_FACTOR = 64
+STDERR_FLOOD_FACTOR = 32
 
 SIGKILL = 9
 SIGXCPU = 24
