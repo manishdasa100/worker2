@@ -148,7 +148,7 @@ async def main():
     print(f"{'PASS' if ok else 'FAIL'} {'stderr-flood-re':16s} -> {report.status_code:3s} (want RE) "
           f"stderr={stderr_len}B (<={cap}B)")
 
-    # ...but a stderr flood (past 64x the cap) is cut off like a stdout one.
+    # ...but a stderr flood (past 32x the cap) is cut off like a stdout one.
     t0 = time.monotonic()
     report = await judge.judge(ExecutionRequest(
         job_id="stderr-flood-ole", language="python",
