@@ -71,12 +71,11 @@ class RedisTransport:
         (crashed-worker) entries first, else a blocking read for fresh ones.
         BLOCKS up to block_ms — run off-loop.
         """
-        count = min(max_entries, self.config.read_count)
-        entries = self._reclaim(count)
+        entries = self._reclaim(max_entries)
         if entries:
             logger.info("Reclaimed %d pending entry(ies) via XAUTOCLAIM", len(entries))
         else:
-            entries = self._read_new(count)
+            entries = self._read_new(max_entries)
             if entries:
                 logger.info("Received %d new entry(ies) via XREADGROUP", len(entries))
         return self._build(entries)
