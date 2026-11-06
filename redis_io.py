@@ -44,6 +44,7 @@ class RedisTransport:
             password=config.password or None,
             decode_responses=True,
         )
+        self._reclaim_cursor = "0-0"
 
     # ---- startup ------------------------------------------------------------
 
@@ -64,29 +65,31 @@ class RedisTransport:
 
     # ---- receive ------------------------------------------------------------
 
-    def consume(self) -> Tuple[List[ExecutionRequest], List[MalformedMessage]]:
+    def consume(self, max_entries: int) -> Tuple[List[ExecutionRequest], List[MalformedMessage]]:
         """
-        Next batch to process. Reclaimed (crashed-worker) entries first, else a
-        blocking read for fresh ones. BLOCKS up to block_ms — run off-loop.
+        Next batch to process, at most max_entries (must be >= 1). Reclaimed
+        (crashed-worker) entries first, else a blocking read for fresh ones.
+        BLOCKS up to block_ms — run off-loop.
         """
-        entries = self._reclaim()
+        count = min(max_entries, self.config.read_count)
+        entries = self._reclaim(count)
         if entries:
             logger.info("Reclaimed %d pending entry(ies) via XAUTOCLAIM", len(entries))
         else:
-            entries = self._read_new()
+            entries = self._read_new(count)
             if entries:
                 logger.info("Received %d new entry(ies) via XREADGROUP", len(entries))
         return self._build(entries)
 
-    def _reclaim(self) -> List[Tuple[str, dict]]:
+    def _reclaim(self, count: int) -> List[Tuple[str, dict]]:
         try:
             result = self.client.xautoclaim(
                 name=self.config.stream_key,
                 groupname=self.config.consumer_group,
                 consumername=self.config.consumer_name,
                 min_idle_time=self.config.autoclaim_min_idle_ms,
-                start_id="0-0",
-                count=self.config.read_count,
+                start_id=self._reclaim_cursor,
+                count=count,
             )
         except ResponseError as e:
             if "NOGROUP" in str(e):
@@ -94,16 +97,19 @@ class RedisTransport:
                 self.ensure_group()
                 return []
             raise
-        # redis-py returns [next_cursor, claimed_entries, deleted_ids]
+        # redis-py returns [next_cursor, claimed_entries, deleted_ids]. Each call
+        # scans only COUNT x 10 pending entries, so resume where this one stopped.
+        if result:
+            self._reclaim_cursor = result[0]
         return (result[1] if result and len(result) >= 2 else []) or []
 
-    def _read_new(self) -> List[Tuple[str, dict]]:
+    def _read_new(self, count: int) -> List[Tuple[str, dict]]:
         try:
             response = self.client.xreadgroup(
                 groupname=self.config.consumer_group,
                 consumername=self.config.consumer_name,
                 streams={self.config.stream_key: ">"},
-                count=self.config.read_count,
+                count=count,
                 block=self.config.block_ms,
             )
         except ResponseError as e:

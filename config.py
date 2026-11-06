@@ -38,7 +38,7 @@ class RedisConfig:
     consumer_name: str = ""               # Blank -> "<hostname>:<pid>"
     block_ms: int = 5000                  # XREADGROUP BLOCK timeout
     autoclaim_min_idle_ms: int = 60000    # Reclaim entries idle longer than this
-    read_count: int = 4                   # Entries per XREADGROUP / XAUTOCLAIM
+    read_count: int = 4                   # Most entries per XREADGROUP / XAUTOCLAIM; free slots lower it
 
     # Outbound results (worker XADDs, backend consumes via its own group)
     result_stream_key: str = "stream:execution-results"

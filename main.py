@@ -63,6 +63,8 @@ def validate_config(config: WorkerConfig) -> None:
             errors.append(f"{label} does not exist: {path}")
     if not config.redis.host:
         errors.append("REDIS_HOST is required")
+    if config.execution.max_concurrent <= 0:
+        errors.append("MAX_CONCURRENT must be > 0")
     for label, val in (("REDIS_STREAM_KEY", config.redis.stream_key),
                        ("REDIS_CONSUMER_GROUP", config.redis.consumer_group),
                        ("REDIS_RESULT_STREAM_KEY", config.redis.result_stream_key),

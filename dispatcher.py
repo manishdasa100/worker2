@@ -1,8 +1,8 @@
 """
 Dispatcher — the async orchestration loop.
 
-Pulls submissions from the transport, runs each through the judge under a
-concurrency semaphore, publishes the result, and acks. Everything Redis lives
+Pulls jobs from the transport only while a slot is free, runs each
+through the judge, publishes the result, and acks. Everything Redis lives
 in RedisTransport; everything verdict lives in Judge. This module is just the
 control flow: liveness, concurrency, in-flight keep-alive, draining, shutdown.
 
@@ -32,7 +32,6 @@ class Dispatcher:
         self.config = config
         self.judge = Judge(config, delegation)
         self.transport = RedisTransport(config.redis)
-        self.semaphore = asyncio.Semaphore(config.execution.max_concurrent)
         self._running = True
         self._active_tasks: set = set()
         self._last_activity = 0.0
@@ -57,7 +56,15 @@ class Dispatcher:
             try:
                 await self._maybe_beat()
 
-                requests, malformed = await loop.run_in_executor(None, self.transport.consume)
+                free_slots = self.config.execution.max_concurrent - len(self._active_tasks)
+                if free_slots == 0:
+                    # Leave jobs in the stream for other workers. Waking every
+                    # block_ms keeps the beat cycle validate_config assumes.
+                    await asyncio.wait(self._active_tasks, timeout=self.config.redis.block_ms / 1000,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                    continue
+
+                requests, malformed = await loop.run_in_executor(None, self.transport.consume, free_slots)
                 consecutive_errors = 0
 
                 for bad in malformed:
@@ -87,22 +94,19 @@ class Dispatcher:
 
     async def _handle_request(self, request: ExecutionRequest) -> None:
         """
-        Judge one submission. A keep-alive task touches the entry for its whole
-        lifetime (including semaphore wait) so a long job isn't duplicated.
+        Judge one job, holding a slot until this task ends. A keep-alive
+        task touches the entry for its whole lifetime so a long job isn't duplicated.
         """
         job_id = request.job_id
         keepalive = asyncio.create_task(self._keepalive_loop(request))
         loop = asyncio.get_running_loop()
         try:
-            async with self.semaphore:
-                logger.info("[%s] Acquired execution slot", job_id)
-                try:
-                    report = await self.judge.judge(request)
-                    await loop.run_in_executor(None, self._publish, report)
-                    # Ack only after a successful publish (skip-on-failure => redelivery).
-                    await loop.run_in_executor(None, self.transport.ack, request.stream_id, job_id)
-                except Exception as e:
-                    logger.error("[%s] Failed: %s", job_id, e)   # execution/publish/ack — leave unacked
+            report = await self.judge.judge(request)
+            await loop.run_in_executor(None, self._publish, report)
+            # Ack only after a successful publish (skip-on-failure => redelivery).
+            await loop.run_in_executor(None, self.transport.ack, request.stream_id, job_id)
+        except Exception as e:
+            logger.error("[%s] Failed: %s", job_id, e)   # execution/publish/ack — leave unacked
         finally:
             keepalive.cancel()
 
