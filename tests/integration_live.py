@@ -3,7 +3,8 @@ Live end-to-end test against the real Redis, exercising the full dispatcher
 loop and the backend contract. Uses ISOLATED test stream keys so production
 streams are untouched.
 
-    systemd-run --user --scope -p Delegate=yes .venv/bin/python tests/integration_live.py
+Parked: the dispatcher still judges in-process, which now runs only inside an
+executor container. Ticket 06 makes this the Seam B suite against a stub executor.
 """
 import asyncio
 import base64
@@ -19,7 +20,6 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s — %(m
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import redis as redis_client
-from cgroups import CgroupDelegation
 from config import load_config
 from dispatcher import Dispatcher
 from redis_io import RedisTransport
@@ -147,10 +147,6 @@ async def main():
     config.redis.block_ms = 1000
     config.execution.max_concurrent = 2
 
-    delegation = CgroupDelegation.try_setup()
-    if delegation is None:
-        print("No delegated cgroup subtree — run via systemd-run"); sys.exit(2)
-
     r = redis_client.Redis(host=config.redis.host, port=config.redis.port,
                            password=config.redis.password or None, decode_responses=True)
 
@@ -160,7 +156,7 @@ async def main():
     job = json.loads(job_body("live-test-1"))
     job["testCases"].append({"input": "20 22", "expectedOutput": "42"})
 
-    dispatcher = Dispatcher(config, delegation)
+    dispatcher = Dispatcher(config)
     runner = asyncio.create_task(dispatcher.start())
     await asyncio.sleep(0)
 

@@ -36,6 +36,10 @@ class StatusCode(str, Enum):
     UNSUPPORTED_LANGUAGE = "UL"
 
 
+# A report with one of these is a worker failure (FAILED), not a verdict.
+WORKER_FAILURE_CODES = (StatusCode.INTERNAL_ERROR, StatusCode.UNSUPPORTED_LANGUAGE)
+
+
 class TestStatus(str, Enum):
     """Per-test-case outcome."""
     PASSED = "PASSED"

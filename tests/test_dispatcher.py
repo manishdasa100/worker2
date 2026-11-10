@@ -75,7 +75,7 @@ class TestReadLoop(unittest.IsolatedAsyncioTestCase):
         config.redis.heartbeat_interval = 0
         config.redis.autoclaim_min_idle_ms = 0     # keep-alive at its 2 s floor
         config.execution.max_concurrent = slots
-        dispatcher = Dispatcher(config, object())   # delegation is only used by the real judge
+        dispatcher = Dispatcher(config)
         dispatcher.transport = FakeTransport(batches)
         dispatcher.judge = FakeJudge()
         runner = asyncio.create_task(dispatcher.start())

@@ -14,10 +14,11 @@ Two profiles share one invocation path:
               malicious source cannot read host files (`#include "/etc/..."`)
               or exhaust host RAM at compile time — the jail's cgroup bounds it.
 
-Rootless: nsjail runs as the worker's own user inside a delegated cgroup v2
-subtree. Each run gets a fresh per-run parent cgroup; after nsjail exits the
-worker reads memory.peak / memory.events / cpu.stat from it — kernel-accurate
-and valid even when the whole PID namespace was SIGKILLed on a TLE.
+Runs as root inside the executor's runsc container (ADR-0003). nsjail joins a
+fresh per-jail cgroup before exec; while it runs, the executor polls the
+cgroup's memory, tracking the peak and killing the jail past the limit, since
+gVisor accounts memory but does not enforce it. CPU time is read at the end.
+The jail runs as JAIL_UID, which owns nothing.
 """
 import asyncio
 import logging
@@ -30,7 +31,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-from cgroups import CgroupDelegation
+from cgroups import JailCgroup
 from config import SandboxConfig
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,11 @@ logger = logging.getLogger(__name__)
 TIME_BINARY = "/usr/bin/time"
 STATS_MOUNT = "/stats"
 STATS_FILENAME = "stats.txt"
+
+JAIL_UID = 65534        # outside id the jail's user maps to (sandbox/*.cfg uidmap)
+MEMORY_POLL_S = 0.01     # ticket 10 folds this into the CPU/wall/memory watchdog
+RUN_PIDS_MAX = 64
+COMPILE_PIDS_MAX = 128   # compiler drivers fork
 
 # stderr is debug output and never judged, so it may run far past the output
 # cap; only a flood this many times the cap kills the jail.
@@ -64,7 +70,7 @@ class SandboxResult:
     nsjail_log: str
     exit_code: int
     timed_out: bool              # exceeded the CPU-ms budget (clean overrun, CPU kill, or wall backstop)
-    oom_killed: bool             # kernel OOM-killed the run's cgroup
+    oom_killed: bool             # memory passed the limit; the jail was killed for it
     runtime_ms: int              # resolved: driver > wrapper > wall
     signal: Optional[int]
     peak_memory_mb: int = 0
@@ -82,14 +88,8 @@ class SandboxResult:
 
 
 class NsjailSandbox:
-    def __init__(self, config: SandboxConfig, delegation: CgroupDelegation, output_limit_bytes: int):
-        if delegation is None:
-            raise ValueError(
-                "NsjailSandbox requires a delegated cgroup subtree — run under "
-                "systemd with Delegate=memory pids, or ./run.sh for dev."
-            )
+    def __init__(self, config: SandboxConfig, output_limit_bytes: int):
         self.config = config
-        self.delegation = delegation
         self.output_limit_bytes = output_limit_bytes
         self._time_wrapper = os.path.isfile(TIME_BINARY)
         if not self._time_wrapper:
@@ -153,9 +153,7 @@ class NsjailSandbox:
         return max(1, math.ceil(time_limit_ms / 1000))
 
     def _build_command(self, command, code_dir, *, config_path, rlimit_cpu_s,
-                       wall_limit_s, memory_limit, writable, log_file, stats_dir,
-                       run_cgroup_dir) -> List[str]:
-        memory_bytes = memory_limit * 1024 * 1024
+                       wall_limit_s, writable, log_file, stats_dir) -> List[str]:
         mount_flag = "--bindmount" if writable else "--bindmount_ro"
         cmd = [
             self.config.nsjail_path,
@@ -163,12 +161,8 @@ class NsjailSandbox:
             "--log", log_file,
             "--rlimit_cpu", str(rlimit_cpu_s),
             "--time_limit", str(wall_limit_s),
-            "--cgroup_mem_max", str(memory_bytes),
-            "--cgroup_mem_swap_max", "0",   # else over-limit swaps out instead of OOM-killing
             mount_flag, f"{code_dir}:/code",
         ]
-        if run_cgroup_dir:
-            cmd += ["--cgroupv2_mount", run_cgroup_dir]
         if stats_dir:
             cmd += ["--bindmount", f"{stats_dir}:{STATS_MOUNT}"]
         cmd.append("--")
@@ -181,12 +175,16 @@ class NsjailSandbox:
         log_path = log_file.name
         log_file.close()
 
-        run_cgroup = self.delegation.create_run_cgroup()
+        if writable:
+            os.chown(code_dir, JAIL_UID, JAIL_UID)   # the compiler writes its output there
+        # +1: nsjail itself sits in the cgroup with the jail
+        run_cgroup = JailCgroup.create(pids_max=(COMPILE_PIDS_MAX if writable else RUN_PIDS_MAX) + 1)
 
         stats_dir = ""
         stats_path = ""
         if measure and self._time_wrapper:
             stats_dir = tempfile.mkdtemp(prefix="nsjail_stats_")
+            os.chown(stats_dir, JAIL_UID, JAIL_UID)
             stats_path = os.path.join(stats_dir, STATS_FILENAME)
             # -a appends after the child exits, preserving any driver_ns line.
             command = [TIME_BINARY, "-a", "-f", "%e",
@@ -197,21 +195,36 @@ class NsjailSandbox:
 
         nsjail_cmd = self._build_command(
             command, code_dir, config_path=config_path, rlimit_cpu_s=rlimit_cpu_s,
-            wall_limit_s=wall_limit_s, memory_limit=memory_limit, writable=writable,
+            wall_limit_s=wall_limit_s, writable=writable,
             log_file=log_path, stats_dir=stats_dir,
-            run_cgroup_dir=run_cgroup.path if run_cgroup else "",
         )
         logger.debug("nsjail: %s", " ".join(nsjail_cmd))
 
-        output_exceeded = False
+        output_exceeded = memory_exceeded = False
+        peak_bytes = 0
+        memory_bytes = memory_limit * 1024 * 1024
+        watcher = None
+
+        def kill_jail():
+            try:
+                run_cgroup.kill(spare=process.pid)   # nsjail survives to log the reap
+            except OSError:
+                process.kill()   # can't list the cgroup: take nsjail down, the jail with it
 
         def kill_for_output():
             nonlocal output_exceeded
             output_exceeded = True
-            try:
-                run_cgroup.kill()
-            except OSError:
-                process.kill()   # no cgroup.kill: take nsjail down, the jail with it
+            kill_jail()
+
+        async def watch_memory():
+            nonlocal peak_bytes, memory_exceeded
+            while True:
+                used = run_cgroup.memory_bytes()
+                peak_bytes = max(peak_bytes, used)
+                if used > memory_bytes and not memory_exceeded:
+                    memory_exceeded = True
+                    kill_jail()
+                await asyncio.sleep(MEMORY_POLL_S)
 
         start = time.monotonic()
         try:
@@ -220,7 +233,9 @@ class NsjailSandbox:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                preexec_fn=run_cgroup.join,
             )
+            watcher = asyncio.create_task(watch_memory())
             # Outer timeout sits above the enforced wall backstop; if it fires
             # nsjail itself hung.
             outer = wall_limit_s + 10
@@ -238,6 +253,7 @@ class NsjailSandbox:
                 self._feed(process.stdin, stdin_data.encode("utf-8")),
                 process.wait()), timeout=outer)
             elapsed_ms = int((time.monotonic() - start) * 1000)
+            watcher.cancel()
 
             with open(log_path, "r", errors="replace") as f:
                 nsjail_log = f.read()
@@ -259,9 +275,8 @@ class NsjailSandbox:
             jail_signal = exits[-1].group(1) if exits else None
             signal = int(jail_signal) if jail_signal else wrapped_signal
 
-            # Kernel counters — definitive, survive a SIGKILLed PID namespace.
-            oom_killed = run_cgroup.oom_killed()
-            peak_memory_mb = run_cgroup.peak_memory_mb()
+            oom_killed = memory_exceeded
+            peak_memory_mb = math.ceil(peak_bytes / (1024 * 1024))
             cpu_ms = run_cgroup.cpu_time_ms()
 
             # TLE verdict (ms-granular, off the cgroup CPU counter):
@@ -311,14 +326,15 @@ class NsjailSandbox:
             return SandboxResult("", f"Failed to launch sandbox: {e}", "", -1,
                                  False, False, elapsed_ms, None, setup_failed=True)
         finally:
+            if watcher is not None:
+                watcher.cancel()
             try:
                 os.unlink(log_path)
             except FileNotFoundError:
                 pass
             if stats_dir:
                 shutil.rmtree(stats_dir, ignore_errors=True)
-            if run_cgroup is not None:
-                run_cgroup.remove()
+            run_cgroup.remove()
 
     @staticmethod
     async def _drain(stream, cap: int, *, tail=False, kill_past=0, kill=None) -> bytes:

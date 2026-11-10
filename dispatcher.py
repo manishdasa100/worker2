@@ -14,23 +14,18 @@ import logging
 import signal
 import time
 
-from cgroups import CgroupDelegation
 from config import WorkerConfig
 from judge import Judge
-from models import ExecutionReport, ExecutionRequest, MalformedMessage, StatusCode
+from models import WORKER_FAILURE_CODES, ExecutionReport, ExecutionRequest, MalformedMessage
 from redis_io import RedisTransport
 
 logger = logging.getLogger(__name__)
 
-# status_codes that mean a worker-level failure (not a user verdict) -> FAILED,
-# no report attached. Everything else is a COMPLETED verdict.
-WORKER_FAILURE_CODES = (StatusCode.INTERNAL_ERROR, StatusCode.UNSUPPORTED_LANGUAGE)
-
 
 class Dispatcher:
-    def __init__(self, config: WorkerConfig, delegation: CgroupDelegation):
+    def __init__(self, config: WorkerConfig):
         self.config = config
-        self.judge = Judge(config, delegation)
+        self.judge = Judge(config)
         self.transport = RedisTransport(config.redis)
         self._running = True
         self._active_tasks: set = set()

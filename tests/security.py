@@ -7,8 +7,9 @@ do; the test asserts the sandbox CONTAINED it. "Contained" means one of:
   * the process was killed by seccomp/limits -> verdict RE/TLE/MLE (no leak)
 A probe that prints  OPEN:<data>  (the sensitive action succeeded) FAILS the test.
 
-Run inside a delegated scope:
-    systemd-run --user --scope -p Delegate=yes .venv/bin/python tests/security.py
+Parked: the judge now runs only inside an executor container (cgroups.py), so
+this in-process script no longer runs as is. Ticket 09 moves it onto Seam A
+(tests/executor_harness.py).
 """
 import asyncio
 import os
@@ -16,7 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cgroups import CgroupDelegation
+import cgroups
 from config import load_config
 from judge import Judge
 from models import ExecutionRequest
@@ -169,10 +170,8 @@ def answer_line(report):
 
 async def main():
     config = load_config(env_file=".env.dev")
-    delegation = CgroupDelegation.try_setup()
-    if delegation is None:
-        print("No delegated cgroup subtree — run via systemd-run"); sys.exit(2)
-    judge = Judge(config, delegation)
+    cgroups.require()
+    judge = Judge(config)
     await judge.warmup()
 
     passed = failed = 0

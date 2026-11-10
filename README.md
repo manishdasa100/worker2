@@ -22,13 +22,14 @@ payloads, same heartbeat key.
 ## Architecture
 
 ```
-main.py        startup: config, validation, cgroup delegation, logging
+main.py        startup: config, validation, logging (becomes the consumer in ticket 06)
+executor.py    run_job over a unix socket, inside a runsc container (Dockerfile)
 dispatcher.py  async loop: concurrency, liveness, in-flight keep-alive, draining
 redis_io.py    ALL Redis: consume / ack / touch / beat / publish (at-least-once)
 judge.py       verdict pipeline: compile (sandboxed) -> run tests -> classify
 calibrate.py   CALIBRATE: measure reference + slow/hog gap verification
 sandbox.py     nsjail wrapper; run + compile profiles; CPU-ms TLE, cgroup metrics
-cgroups.py     rootless cgroup v2 delegation + per-run accounting cgroup
+cgroups.py     per-jail cgroups on runsc's v1 cgroupfs
 languages/     declarative handlers (write_files / compile_command / run_command)
 sandbox/       run.cfg (default-deny seccomp) + compile.cfg (sandboxed compiler)
 ```
@@ -38,8 +39,9 @@ judging, and sandboxing no longer bleed into each other.
 
 ## Security model (defense in depth)
 
-Every execution — **including compilation** — runs inside nsjail, rootless
-(the worker's own uid, no sudo), in a delegated cgroup v2 subtree.
+Every execution — **including compilation** — runs inside nsjail, inside an
+executor container under gVisor (`runsc`, `--network=none`). The executor is
+root in its container; jails map to uid 65534.
 
 | Boundary | Enforced by |
 |---|---|
@@ -47,7 +49,7 @@ Every execution — **including compilation** — runs inside nsjail, rootless
 | No network | empty net namespace |
 | No privileges | user namespace, `no_new_privs`, all caps dropped |
 | CPU / TLE | cgroup CPU-time counter (ms-granular) + wall-clock backstop |
-| Memory / MLE | cgroup `memory.max` (+ `memory.peak`/`events` read back) |
+| Memory / MLE | executor polls the jail cgroup's usage and kills past the limit (gVisor accounts memory but does not enforce it) |
 | Processes / fork bombs | cgroup `pids.max` + `rlimit_nproc` |
 | Output / disk | output cap + `rlimit_fsize` |
 | Syscalls (user code) | **default-deny** seccomp allow-list (`KILL_PROCESS`) |
@@ -85,15 +87,19 @@ uses suffixed keys, so run it with full-access credentials.
 
 ## Running
 
-Requires a delegated cgroup v2 subtree (rootless sandbox). Dev:
+Jails run only in the executor, as root inside a `runsc` container; it refuses
+to start anywhere else. The host needs Docker and gVisor with a runtime that
+lets the executor create its socket in the mounted directory:
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env.dev    # edit Redis + paths
-./run.sh dev                # wraps: systemd-run --user --scope -p Delegate=yes ...
-```
+sudo runsc install --runtime=runsc-executor -- --platform=systrap --host-uds=create
+sudo systemctl reload docker
 
-Prod: a systemd unit with `User=<worker>` and `Delegate=memory pids`.
+docker build -t codinglemons-executor .
+docker run -d --runtime=runsc-executor --network=none \
+  -v /run/codinglemons/slot1:/run/executor codinglemons-executor
+# -> socket at /run/codinglemons/slot1/executor.sock
+```
 
 ## Tests
 
@@ -101,13 +107,12 @@ Prod: a systemd unit with `User=<worker>` and `Delegate=memory pids`.
 # fast, no sandbox
 .venv/bin/python -m unittest tests.test_contract
 
-# require a delegated scope:
-systemd-run --user --scope -p Delegate=yes .venv/bin/python tests/smoke.py            # 3 langs, compile+run
-systemd-run --user --scope -p Delegate=yes .venv/bin/python tests/verdict_matrix.py   # TLE/MLE/RE + fairness
-systemd-run --user --scope -p Delegate=yes .venv/bin/python tests/security.py         # adversarial containment
-systemd-run --user --scope -p Delegate=yes .venv/bin/python tests/integration_live.py # full loop over real Redis
+# Seam A: builds the image, starts an executor under runsc-executor, talks to its socket
+.venv/bin/python -m unittest tests.test_executor
 ```
 
-`tests/security.py` asserts containment of: host-file reads, filesystem escapes,
+`tests/verdict_matrix.py`, `tests/security.py` and `tests/integration_live.py`
+drive the judge in-process and are parked until tickets 07, 09 and 06 move them
+onto Seam A / Seam B. `tests/security.py` asserts containment of: host-file reads, filesystem escapes,
 worker-secret/`/proc` leakage, outbound network, privilege escalation, disk fill,
 fork bombs, default-deny seccomp, and the compile-time file-read hole.

@@ -2,7 +2,9 @@
 Verdict matrix against the real sandbox: TLE/MLE/RE classification, per-language
 fairness, worker caps. time_limit is CPU-ms, memory_limit is MB.
 
-    systemd-run --user --scope -p Delegate=yes .venv/bin/python tests/verdict_matrix.py
+Parked: the judge now runs only inside an executor container (cgroups.py), so
+this in-process script no longer runs as is. Ticket 07 moves it onto Seam A
+(tests/executor_harness.py).
 """
 import asyncio
 import os
@@ -12,7 +14,7 @@ import tracemalloc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cgroups import CgroupDelegation
+import cgroups
 from config import load_config
 from judge import Judge
 from languages import LANGUAGES
@@ -76,10 +78,8 @@ EXPECTED = {"input": "", "expectedOutput": "42"}
 
 async def main():
     config = load_config(env_file=".env.dev")
-    delegation = CgroupDelegation.try_setup()
-    if delegation is None:
-        print("No delegated cgroup subtree — run via systemd-run"); sys.exit(2)
-    judge = Judge(config, delegation)
+    cgroups.require()
+    judge = Judge(config)
     await judge.warmup()
     failures = 0
 

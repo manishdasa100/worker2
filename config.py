@@ -16,8 +16,8 @@ Grouped into four dataclasses:
 import os
 import socket
 from dataclasses import dataclass, field
+from typing import Optional
 
-from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ def _float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
-def load_config(env_file: str) -> WorkerConfig:
+def load_config(env_file: Optional[str]) -> WorkerConfig:
     """
     Build a WorkerConfig from an env file + os.environ (real env wins).
 
@@ -119,13 +119,18 @@ def load_config(env_file: str) -> WorkerConfig:
         NSJAIL_COMPILE_CONFIG_PATH             — compile jail profile
     NSJAIL_CONFIG_PATH (worker1's single profile) is still accepted as a
     fallback for the run profile.
+
+    env_file None reads os.environ alone: the executor image has no env file
+    (and no python-dotenv).
     """
-    if not os.path.isfile(env_file):
-        raise SystemExit(
-            f"[config] Required env file '{env_file}' not found. "
-            f"Copy .env.example to {env_file} and fill in your values."
-        )
-    load_dotenv(env_file, override=False)
+    if env_file is not None:
+        if not os.path.isfile(env_file):
+            raise SystemExit(
+                f"[config] Required env file '{env_file}' not found. "
+                f"Copy .env.example to {env_file} and fill in your values."
+            )
+        from dotenv import load_dotenv
+        load_dotenv(env_file, override=False)
 
     c = WorkerConfig()
 

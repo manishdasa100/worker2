@@ -20,7 +20,6 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from cgroups import CgroupDelegation
 from config import WorkerConfig
 from languages import get_language, LANGUAGES
 from models import (
@@ -55,9 +54,9 @@ class CompileOutcome:
 
 
 class Judge:
-    def __init__(self, config: WorkerConfig, delegation: CgroupDelegation):
+    def __init__(self, config: WorkerConfig):
         self.config = config
-        self.sandbox = NsjailSandbox(config.sandbox, delegation, config.execution.max_output_bytes)
+        self.sandbox = NsjailSandbox(config.sandbox, config.execution.max_output_bytes)
 
     # ---- warmup -------------------------------------------------------------
 

@@ -6,9 +6,9 @@ Usage:
     python main.py --env prod    # reads .env.prod
     python main.py               # reads .env
 
-Requires a delegated cgroup v2 subtree (rootless nsjail):
-    dev   — ./run.sh  (wraps: systemd-run --user --scope -p Delegate=yes ...)
-    prod  — a systemd unit with User=<worker> and Delegate=memory pids
+Still judges in-process, so it only starts where the executor can (as root in
+a runsc container, see cgroups.py). Ticket 06 turns it into the host-side
+consumer that hands jobs to executor.py instead.
 """
 import argparse
 import asyncio
@@ -20,7 +20,7 @@ import sys
 import redis as redis_client
 from redis.exceptions import AuthenticationError, ConnectionError as RedisConnectionError
 
-from cgroups import CgroupDelegation
+import cgroups
 from config import WorkerConfig, load_config
 from dispatcher import Dispatcher
 
@@ -114,14 +114,13 @@ def main() -> None:
     validate_config(config)
     os.makedirs(config.execution.temp_dir, exist_ok=True)
 
-    delegation = CgroupDelegation.try_setup()
-    if delegation is None:
-        logger.error("No delegated cgroup v2 subtree — cannot run sandboxes. Use ./run.sh (dev) or a "
-                     "systemd unit with Delegate=memory pids (prod).")
+    try:
+        cgroups.require()
+    except RuntimeError as e:
+        logger.error("%s", e)
         sys.exit(1)
 
     logger.info("=== CodingLemons worker2 ===")
-    logger.info("  Delegated cgroup: %s", delegation.root)
     logger.info("  Redis:           %s:%d", config.redis.host, config.redis.port)
     logger.info("  Submit stream:   %s (group %s)", config.redis.stream_key, config.redis.consumer_group)
     logger.info("  Result stream:   %s (maxlen=%s)", config.redis.result_stream_key,
@@ -140,7 +139,7 @@ def main() -> None:
         logger.warning("MAX_CONCURRENT (%d) >= cores (%d) — sandboxes will contend for CPU and inflate "
                        "runtimes. Recommend <= cores-1.", config.execution.max_concurrent, cores)
 
-    asyncio.run(Dispatcher(config, delegation).start())
+    asyncio.run(Dispatcher(config).start())
 
 
 if __name__ == "__main__":
