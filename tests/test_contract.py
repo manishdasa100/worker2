@@ -66,12 +66,17 @@ class TestOutboundPayload(unittest.TestCase):
     def test_completed_has_report(self):
         p = json.loads(result_payload("j1", "COMPLETED", '{"x":1}'))
         self.assertEqual(p, {"job_id": "j1", "status": "COMPLETED",
-                             "worker_type": "NSJAIL_WORKER", "execution_report": '{"x":1}'})
+                             "worker_type": "GVISOR_WORKER", "execution_report": '{"x":1}'})
 
     def test_failed_omits_report(self):
         p = json.loads(result_payload("j1", "FAILED"))
-        self.assertEqual(p, {"job_id": "j1", "status": "FAILED", "worker_type": "NSJAIL_WORKER"})
+        self.assertEqual(p, {"job_id": "j1", "status": "FAILED", "worker_type": "GVISOR_WORKER"})
         self.assertNotIn("execution_report", p)
+
+    def test_failed_carries_an_optional_error(self):
+        p = json.loads(result_payload("j1", "FAILED", error="retries exhausted"))
+        self.assertEqual(p, {"job_id": "j1", "status": "FAILED", "worker_type": "GVISOR_WORKER",
+                             "error": "retries exhausted"})
 
 
 if __name__ == "__main__":

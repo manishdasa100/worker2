@@ -1,8 +1,8 @@
 """
 Redis transport — the single owner of every Redis interaction.
 
-Collects what worker1 spread across consumer.py and dispatcher.py into one
-cohesive object so the dispatcher deals in requests/reports, not Redis verbs.
+Collects what worker1 spread across its consumer and dispatcher into one
+cohesive object so the consumer deals in requests/results, not Redis verbs.
 
 Delivery semantics (unchanged from worker1):
   * At-least-once: an entry is XACK+XDEL'd only after its result is published.
@@ -12,7 +12,7 @@ Delivery semantics (unchanged from worker1):
   * Result delivery to the backend is its own group's concern — an entry it
     reads but never ACKs stays in its PEL and redelivers.
 
-All methods here are synchronous (thin Redis calls). The dispatcher runs the
+All methods here are synchronous (thin Redis calls). The consumer runs the
 blocking ones (consume, publish) in a thread to keep the event loop free.
 """
 import json
@@ -187,13 +187,14 @@ class RedisTransport:
 
     # ---- publish result -----------------------------------------------------
 
-    def publish(self, job_id: str, status: str, report_json: Optional[str] = None) -> None:
+    def publish(self, job_id: str, status: str, report_json: Optional[str] = None,
+                error: Optional[str] = None) -> None:
         """
         XADD one result entry (single `body` field). Retries 3x, then RAISES so
         the caller skips the submission ack and XAUTOCLAIM redelivers it. BLOCKS
         on retry sleeps — run off-loop.
         """
-        body = result_payload(job_id, status, report_json)
+        body = result_payload(job_id, status, report_json, error)
         maxlen = self.config.result_stream_maxlen or None
         attempts = 3
         for attempt in range(1, attempts + 1):

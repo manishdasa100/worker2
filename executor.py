@@ -79,6 +79,7 @@ async def serve(path: str) -> None:
     config = load_config(env_file=None)
     os.makedirs(config.execution.temp_dir, exist_ok=True)
     executor = Executor(Judge(config))
+    await executor.judge.warmup()   # ticket 13's self-test smoke runs replace this
     if os.path.exists(path):
         os.unlink(path)          # left by a crashed predecessor
     server = await asyncio.start_unix_server(executor.handle, path, limit=MAX_REQUEST_BYTES)

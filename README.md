@@ -2,18 +2,20 @@
 
 Executes untrusted user submissions for a LeetCode-style judge and returns
 verdicts. A clean rebuild of `../worker` that keeps the proven execution core
-and closes its security gaps. Drop-in on the backend: same Redis streams, same
-payloads, same heartbeat key.
+and closes its security gaps. Same Redis streams, payloads and heartbeat key as
+before, apart from the additive fields and the `worker_type` rename below.
 
-## Contract (unchanged — the backend depends on it)
+## Contract (the backend depends on it)
 
 - **Submissions**: consumed from `stream:pending-submissions` (group `workers`).
   Entry field `body` = JSON `{jobId, language, userCode(b64), driverCode(b64),
   task, timeLimit(CPU-ms), memoryLimit(MB), testCases:[{input,expectedOutput}],
   slowCode?, hogCode?}`.
 - **Results**: XADD'd to `stream:execution-results`. Entry field `body` = JSON
-  `{job_id, status: COMPLETED|FAILED, worker_type: "NSJAIL_WORKER",
-  execution_report: <JSON string, COMPLETED only>}`.
+  `{job_id, status: COMPLETED|FAILED, worker_type: "GVISOR_WORKER",
+  execution_report: <JSON string, COMPLETED only>, error?: <string, FAILED only>}`.
+  `worker_type` was `NSJAIL_WORKER`; the backend must accept the new value
+  before this worker publishes to production.
 - **Liveness**: key `executor:nsjail:heartbeat` (SET+EX, existence-gated). The
   backend only enqueues while it exists. Shared by all workers; never deleted.
 - **Tasks**: `RUN_CODE` (run all, report each), `SUBMIT_CODE` (stop at first
@@ -22,10 +24,13 @@ payloads, same heartbeat key.
 ## Architecture
 
 ```
-main.py        startup: config, validation, logging (becomes the consumer in ticket 06)
-executor.py    run_job over a unix socket, inside a runsc container (Dockerfile)
-dispatcher.py  async loop: concurrency, liveness, in-flight keep-alive, draining
+Consumer, on the host (holds the Redis credentials, no judging code):
+main.py        startup: config, validation, logging
+consumer.py    async loop: free-slot reads, run_job to executors, liveness, keep-alive, draining
 redis_io.py    ALL Redis: consume / ack / touch / beat / publish (at-least-once)
+
+Executor, one per slot in a runsc container (Dockerfile; no secrets, no network):
+executor.py    answers run_job on its unix socket, one job at a time
 judge.py       verdict pipeline: compile (sandboxed) -> run tests -> classify
 calibrate.py   CALIBRATE: measure reference + slow/hog gap verification
 sandbox.py     nsjail wrapper; run + compile profiles; CPU-ms TLE, cgroup metrics
@@ -82,7 +87,7 @@ ACL SETUSER worker on >LONG_RANDOM_PASSWORD resetkeys resetchannels \
 A stolen worker login can then only touch the job queue, write results and
 the heartbeat. It cannot read results, touch other keys, `FLUSHALL`,
 `CONFIG SET` or `EVAL`. Give the backend its own user and
-`ACL SETUSER default off`. `tests/integration_live.py` plays the backend and
+`ACL SETUSER default off`. `tests/test_consumer.py` plays the backend and
 uses suffixed keys, so run it with full-access credentials.
 
 ## Running
@@ -101,18 +106,29 @@ docker run -d --runtime=runsc-executor --network=none \
 # -> socket at /run/codinglemons/slot1/executor.sock
 ```
 
+The consumer runs on the host from the venv, with `EXECUTOR_SOCKETS` listing
+one executor socket per slot:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env.dev    # Redis + EXECUTOR_SOCKETS
+.venv/bin/python main.py --env dev
+```
+
 ## Tests
 
 ```bash
-# fast, no sandbox
-.venv/bin/python -m unittest tests.test_contract
+# fast, no Redis, no containers
+.venv/bin/python -m unittest tests.test_contract tests.test_read_loop
+
+# Seam B: the consumer against real Redis (.env.dev) and stub executors
+.venv/bin/python -m unittest tests.test_consumer
 
 # Seam A: builds the image, starts an executor under runsc-executor, talks to its socket
 .venv/bin/python -m unittest tests.test_executor
 ```
 
-`tests/verdict_matrix.py`, `tests/security.py` and `tests/integration_live.py`
-drive the judge in-process and are parked until tickets 07, 09 and 06 move them
-onto Seam A / Seam B. `tests/security.py` asserts containment of: host-file reads, filesystem escapes,
+`tests/verdict_matrix.py` and `tests/security.py` drive the judge in-process
+and are parked until tickets 07 and 09 move them onto Seam A. `tests/security.py` asserts containment of: host-file reads, filesystem escapes,
 worker-secret/`/proc` leakage, outbound network, privilege escalation, disk fill,
 fork bombs, default-deny seccomp, and the compile-time file-read hole.

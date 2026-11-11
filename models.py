@@ -1,8 +1,8 @@
 """
 Wire models + (de)serialization.
 
-The payloads here are a FIXED CONTRACT with the backend and are byte-for-byte
-identical to worker1:
+The payloads here are a FIXED CONTRACT with the backend. They match worker1's
+except for the spec's additive changes and the worker_type rename:
 
   Inbound (submission stream entry `body` field, JSON):
     {"jobId", "language", "userCode"(b64), "driverCode"(b64), "task",
@@ -10,8 +10,9 @@ identical to worker1:
      "slowCode"(b64, CALIBRATE), "hogCode"(b64, CALIBRATE)}
 
   Outbound (result stream entry `body` field, JSON):
-    {"job_id", "status": COMPLETED|FAILED, "worker_type": "NSJAIL_WORKER",
-     "execution_report": <JSON string>}   # execution_report omitted on FAILED
+    {"job_id", "status": COMPLETED|FAILED, "worker_type": "GVISOR_WORKER",
+     "execution_report": <JSON string>,   # COMPLETED only
+     "error": <string>}                   # FAILED only, optional
 """
 import base64
 import json
@@ -20,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
-WORKER_TYPE = "NSJAIL_WORKER"   # Identifies this producer on the result stream (contract)
+WORKER_TYPE = "GVISOR_WORKER"   # Identifies this producer on the result stream (contract)
 
 
 class StatusCode(str, Enum):
@@ -160,14 +161,17 @@ def parse_job_message(body: str, stream_id: str = "") -> ExecutionRequest:
     )
 
 
-def result_payload(job_id: str, status: str, report_json: Optional[str] = None) -> str:
+def result_payload(job_id: str, status: str, report_json: Optional[str] = None,
+                   error: Optional[str] = None) -> str:
     """
     Build the result stream entry's `body` JSON (worker -> backend).
 
     status is COMPLETED (report attached) or FAILED (no report — worker-level
-    failure, not retriable as a verdict). Matches worker1's envelope exactly.
+    failure, not a verdict — optionally with the error saying why).
     """
     payload = {"job_id": job_id, "status": status, "worker_type": WORKER_TYPE}
     if report_json is not None:
         payload["execution_report"] = report_json
+    if error is not None:
+        payload["error"] = error
     return json.dumps(payload)

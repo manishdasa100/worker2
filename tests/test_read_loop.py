@@ -1,6 +1,6 @@
 """
-The dispatcher's read loop, with the transport and judge faked (no Redis, no jails).
-    python3 -m unittest tests.test_dispatcher -v   (from the worker2 dir)
+The consumer's read loop, with the transport and executors faked (no Redis, no sockets).
+    python3 -m unittest tests.test_read_loop -v   (from the worker2 dir)
 """
 import asyncio
 import os
@@ -8,11 +8,12 @@ import sys
 import time
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import WorkerConfig
-from dispatcher import Dispatcher
+from consumer import Consumer
 
 
 class FakeTransport:
@@ -26,6 +27,7 @@ class FakeTransport:
 
     def ensure_group(self): pass
     def ack(self, stream_id, job_id=""): pass
+    def publish(self, job_id, status, report_json=None, error=None): pass
     def close(self): pass
     def beat(self): self.beats += 1
     def touch(self, stream_id): self.touched.append(stream_id)
@@ -38,18 +40,16 @@ class FakeTransport:
         return [], []
 
 
-class FakeJudge:
+class FakeExecutors:
     """Holds each job in its slot until the test finishes it."""
 
     def __init__(self):
         self.running = {}
 
-    async def warmup(self): pass
-
-    async def judge(self, request):
+    async def run_job(self, socket_path, request):
         done = self.running[request.job_id] = asyncio.Event()
         await done.wait()
-        return SimpleNamespace(execution_id=request.job_id)
+        return {"status": "FAILED", "error": "fake"}
 
     def finish(self, job_id):
         self.running[job_id].set()
@@ -70,45 +70,47 @@ async def until(condition, timeout=5.0):
 class TestReadLoop(unittest.IsolatedAsyncioTestCase):
     async def _start(self, slots, batches):
         config = WorkerConfig()
-        config.redis.host = ""          # _publish becomes a no-op
         config.redis.block_ms = 10
         config.redis.heartbeat_interval = 0
         config.redis.autoclaim_min_idle_ms = 0     # keep-alive at its 2 s floor
-        config.execution.max_concurrent = slots
-        dispatcher = Dispatcher(config)
-        dispatcher.transport = FakeTransport(batches)
-        dispatcher.judge = FakeJudge()
-        runner = asyncio.create_task(dispatcher.start())
+        config.executor_sockets = [f"slot{i}.sock" for i in range(slots)]
+        consumer = Consumer(config)
+        consumer.transport = FakeTransport(batches)
+        executors = FakeExecutors()
+        patch = mock.patch("consumer.run_job", executors.run_job)
+        patch.start()
+        runner = asyncio.create_task(consumer.start())
 
         async def stop():
-            dispatcher._handle_shutdown()
-            for done in dispatcher.judge.running.values():
+            consumer._handle_shutdown()
+            for done in executors.running.values():
                 done.set()
             await asyncio.wait_for(runner, 5)
+            patch.stop()
         self.addAsyncCleanup(stop)
-        return dispatcher.transport, dispatcher.judge
+        return consumer.transport, executors
 
     async def test_a_read_asks_for_exactly_the_free_slots(self):
-        transport, judge = await self._start(slots=3, batches=[jobs("a"), jobs("b")])
+        transport, executors = await self._start(slots=3, batches=[jobs("a"), jobs("b")])
         await until(lambda: len(transport.reads) >= 3)
         self.assertEqual(transport.reads[:3], [3, 2, 1])
 
-        judge.finish("a")
+        executors.finish("a")
         await until(lambda: len(transport.reads) > 3 and transport.reads[-1] == 2)
 
     async def test_no_read_while_every_slot_is_busy(self):
-        transport, judge = await self._start(slots=2, batches=[jobs("a", "b"), jobs("c")])
-        await until(lambda: len(judge.running) == 2)
+        transport, executors = await self._start(slots=2, batches=[jobs("a", "b"), jobs("c")])
+        await until(lambda: len(executors.running) == 2)
         await asyncio.sleep(0.1)        # many block_ms cycles
         self.assertEqual(transport.reads, [2])
 
-        judge.finish("a")
-        await until(lambda: "c" in judge.running)
+        executors.finish("a")
+        await until(lambda: "c" in executors.running)
         self.assertEqual(transport.reads, [2, 1])
 
     async def test_heartbeat_and_keepalive_run_while_every_slot_is_busy(self):
-        transport, judge = await self._start(slots=1, batches=[jobs("a")])
-        await until(lambda: "a" in judge.running)
+        transport, executors = await self._start(slots=1, batches=[jobs("a")])
+        await until(lambda: "a" in executors.running)
         beats = transport.beats
 
         await until(lambda: transport.beats > beats + 3 and "a-0" in transport.touched)

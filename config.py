@@ -11,12 +11,15 @@ Grouped into four dataclasses:
     RedisConfig     — stream transport + liveness heartbeat (the backend contract)
     SandboxConfig   — nsjail binary, the run/compile jail profiles, timing backstop
     ExecutionConfig — limits, fairness caps, calibration, compile budgets
-    WorkerConfig    — top-level container
+    WorkerConfig    — top-level container, plus the consumer's executor sockets
+
+The consumer reads RedisConfig and EXECUTOR_SOCKETS; the executor reads
+SandboxConfig and ExecutionConfig from its container's environment.
 """
 import os
 import socket
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 
 
@@ -65,7 +68,6 @@ class SandboxConfig:
 
 @dataclass
 class ExecutionConfig:
-    max_concurrent: int = 4
     default_time_limit_ms: int = 5000     # Max CPU-ms budget per test case (clamps request)
     default_memory_limit: int = 128       # MB per sandbox (clamps request)
     max_output_bytes: int = 262144        # 256 KB output cap
@@ -79,9 +81,6 @@ class ExecutionConfig:
     # compile time or exhaust host RAM. These bound that jail.
     compile_timeout: int = 30             # CPU-seconds for the compile step
     compile_memory_limit: int = 512       # MB for the compile jail (g++/javac are hungry)
-
-    # Re-warm runtimes after this long idle (0 disables). Boot warmup always runs.
-    warmup_idle_seconds: int = 1800
 
     # --- CALIBRATE task ---
     calibration_runs: int = 5
@@ -99,6 +98,8 @@ class WorkerConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     max_consecutive_errors: int = 5       # Shut down after this many back-to-back loop errors
+    # Consumer: one executor socket per slot; the slot count is their number.
+    executor_sockets: List[str] = field(default_factory=lambda: ["/run/codinglemons/slot1/executor.sock"])
 
 
 def _int(name: str, default: int) -> int:
@@ -167,7 +168,6 @@ def load_config(env_file: Optional[str]) -> WorkerConfig:
 
     # --- Execution ---
     e = c.execution
-    e.max_concurrent = _int("MAX_CONCURRENT", e.max_concurrent)
     e.default_time_limit_ms = _int("DEFAULT_TIME_LIMIT_MS", e.default_time_limit_ms)
     e.default_memory_limit = _int("DEFAULT_MEMORY_LIMIT", e.default_memory_limit)
     e.max_output_bytes = _int("MAX_OUTPUT_BYTES", e.max_output_bytes)
@@ -176,7 +176,6 @@ def load_config(env_file: Optional[str]) -> WorkerConfig:
     e.temp_dir = os.environ.get("TEMP_DIR", e.temp_dir)
     e.compile_timeout = _int("COMPILE_TIMEOUT", _int("COMPILATION_TIMEOUT", e.compile_timeout))
     e.compile_memory_limit = _int("COMPILE_MEMORY_LIMIT", e.compile_memory_limit)
-    e.warmup_idle_seconds = _int("WARMUP_IDLE_SECONDS", e.warmup_idle_seconds)
     e.calibration_runs = _int("CALIBRATION_RUNS", e.calibration_runs)
     e.calibration_time_limit = _int("CALIBRATION_TIME_LIMIT", e.calibration_time_limit)
     e.calibration_memory_limit = _int("CALIBRATION_MEMORY_LIMIT", e.calibration_memory_limit)
@@ -186,4 +185,7 @@ def load_config(env_file: Optional[str]) -> WorkerConfig:
     e.calibration_memory_floor_mb = _int("CALIBRATION_MEMORY_FLOOR_MB", e.calibration_memory_floor_mb)
 
     c.max_consecutive_errors = _int("MAX_CONSECUTIVE_ERRORS", c.max_consecutive_errors)
+    sockets = os.environ.get("EXECUTOR_SOCKETS")
+    if sockets is not None:
+        c.executor_sockets = [p.strip() for p in sockets.split(",") if p.strip()]
     return c
