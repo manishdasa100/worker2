@@ -15,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && make -C /nsjail -j2
 
 FROM ubuntu:24.04
-# python3 is 3.12 on 24.04. `time` is the GNU time run wrapper (removed in 10).
+# python3 is 3.12 on 24.04.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 time libnl-route-3-200 libprotobuf32t64 \
+        python3 libnl-route-3-200 libprotobuf32t64 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=nsjail /nsjail/nsjail /usr/local/bin/nsjail
 

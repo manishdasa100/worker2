@@ -61,9 +61,6 @@ class SandboxConfig:
     run_config_path: str = ""             # Jail profile for running user code
     compile_config_path: str = ""         # Jail profile for the compiler
     java_path: str = "/usr/lib/jvm/java-11-openjdk-amd64/bin/java"
-    # TLE is enforced on CPU time (cgroup counter). The wall clock is only a
-    # backstop at CPU-limit + this, catching sleepers/deadlocks (no CPU burn).
-    wall_clock_grace: int = 5
 
 
 @dataclass
@@ -164,7 +161,6 @@ def load_config(env_file: Optional[str]) -> WorkerConfig:
     )
     s.compile_config_path = os.environ.get("NSJAIL_COMPILE_CONFIG_PATH", s.compile_config_path)
     s.java_path = os.environ.get("JAVA_PATH", s.java_path)
-    s.wall_clock_grace = _int("WALL_CLOCK_GRACE", s.wall_clock_grace)
 
     # --- Execution ---
     e = c.execution

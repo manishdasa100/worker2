@@ -94,7 +94,7 @@ class Judge:
         Compile inside the jail (no host FS, no network, cgroup-bounded). Maps the
         sandbox result to a compile verdict:
           None command      -> interpreted, trivially ok
-          timed_out         -> compile time limit (likely a compile bomb)
+          time_limit_hit    -> compile time limit (likely a compile bomb)
           oom_killed        -> compile ran out of memory
           exit != 0         -> compiler diagnostics (stderr)
         """
@@ -113,7 +113,7 @@ class Judge:
         if sr.setup_failed:
             raise RuntimeError(f"Jail failed to launch the compiler (exit={sr.exit_code}): "
                                f"{sr.nsjail_log[-500:]}")
-        if sr.timed_out:
+        if sr.time_limit_hit:
             return CompileOutcome(False, "Compilation timed out", compile_ms)
         if sr.oom_killed:
             return CompileOutcome(False, "Compilation ran out of memory", compile_ms)
@@ -229,9 +229,10 @@ class Judge:
             return TestCaseResult(index, TestStatus.OUTPUT_LIMIT, input_data, expected_output,
                                   runtime_ms=sandbox_result.runtime_ms, memory_mb=sandbox_result.peak_memory_mb)
 
-        if sandbox_result.timed_out:
+        if sandbox_result.time_limit_hit:
             return TestCaseResult(index, TestStatus.TIMEOUT, input_data, expected_output,
                                   std_output=partial_stdout, stderr=partial_stderr,
+                                  error_message=f"{sandbox_result.time_limit_hit} time limit exceeded",
                                   runtime_ms=sandbox_result.runtime_ms, memory_mb=sandbox_result.peak_memory_mb)
 
         runtime_oom = any(m in (sandbox_result.stderr or "") for m in oom_markers)

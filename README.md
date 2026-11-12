@@ -53,7 +53,7 @@ root in its container; jails map to uid 65534.
 | No host filesystem | tmpfs `/`, only `/usr` (toolchain) read-only + the code dir |
 | No network | empty net namespace |
 | No privileges | user namespace, `no_new_privs`, all caps dropped |
-| CPU / TLE | cgroup CPU-time counter (ms-granular) + wall-clock backstop |
+| CPU / TLE | executor watchdog polls the jail cgroup every 10 ms and kills past the CPU limit or a wall limit of 2 × CPU + 1 s; nsjail rlimits a second above as backstop |
 | Memory / MLE | executor polls the jail cgroup's usage and kills past the limit (gVisor accounts memory but does not enforce it) |
 | Processes / fork bombs | cgroup `pids.max` + `rlimit_nproc` |
 | Output / disk | output cap + `rlimit_fsize` |

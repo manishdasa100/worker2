@@ -4,6 +4,7 @@ Seam A: Python jobs judged by a real executor container under runsc.
 """
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -80,6 +81,38 @@ class TestPythonVerdicts(unittest.TestCase):
 
     def test_cpu_loop_is_time_limit_exceeded(self):
         self.verdict(executor.run_job(**python_job("def f():\n    while True: pass\n")), "TLE")
+
+    def test_cpu_spin_is_killed_soon_after_the_cpu_limit(self):
+        # 200 ms budget x Python's 3 = 600 ms enforced, above the ~400 ms an empty jail's
+        # startup costs, so the kill lands in the loop. No driver timing: runtime is CPU time.
+        report = self.verdict(executor.run_job(**python_job(
+            "def f():\n    while True: pass\n", time_limit=200)), "TLE")
+        self.assertIn("cpu time", report["failed_testcase"]["error_message"])
+        self.assertLessEqual(report["runtime_ms"], 900)   # at most ~300 ms past the limit
+
+    def test_sleeping_is_a_wall_time_limit(self):
+        # 333 ms x 3 = 999 ms CPU enforced; wall is killed at 2 x 999 + 1000 ms.
+        started = time.monotonic()
+        report = self.verdict(executor.run_job(**python_job(
+            "import time\ndef f():\n    time.sleep(30)\n", time_limit=333)), "TLE")
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn("wall time", report["failed_testcase"]["error_message"])
+
+    def test_finishing_just_under_the_enforced_cpu_limit_is_accepted(self):
+        # 500 ms x 3 = 1500 ms enforced; leave room for interpreter startup.
+        self.verdict(executor.run_job(**python_job(
+            "import time\ndef f():\n    while time.process_time() < 1.2: pass\n    return 42\n",
+            time_limit=500)), "ACC")
+
+    def test_runtime_is_the_drivers_own_timing_when_it_emits_one(self):
+        driver = F_DRIVER + "open('/stats/stats.txt', 'a').write('driver_ns 7000000\\n')\n"
+        report = self.verdict(executor.run_job(**python_job("def f():\n    return 42\n", driver)), "ACC")
+        self.assertEqual(report["runtime_ms"], 7)
+
+    def test_runtime_without_driver_timing_is_cpu_time_not_wall_time(self):
+        report = self.verdict(executor.run_job(**python_job(
+            "import time\ndef f():\n    time.sleep(2)\n    return 42\n")), "ACC")
+        self.assertLess(report["runtime_ms"], 1000)   # startup CPU only; the 2 s sleep isn't counted
 
     def test_allocating_past_the_limit_is_memory_limit_exceeded(self):
         self.verdict(executor.run_job(**python_job(

@@ -91,7 +91,7 @@ class Calibrator:
                                             time_limit_ms=time_limit_ms, memory_limit=memory_limit)
                 tc = self.judge._evaluate_test_case(i, sr, input_data, expected, lang.oom_error_markers)
                 entry["samples"].append({"run": run_no, "runtime_ms": sr.runtime_ms, "driver_ms": sr.driver_ms,
-                                         "wrapper_ms": sr.wrapper_ms, "wall_ms": sr.wall_ms,
+                                         "wall_ms": sr.wall_ms,
                                          "cpu_ms": sr.cpu_ms, "memory_mb": sr.peak_memory_mb})
                 if tc.status != TestStatus.PASSED:
                     return entries, tc
