@@ -1,5 +1,5 @@
 """
-Seam A: Python jobs judged by a real executor container under runsc.
+Seam A: jobs judged by a real executor container under runsc.
     .venv/bin/python -m unittest tests.test_executor -v   (needs Docker; see executor_harness)
 """
 import os
@@ -20,6 +20,9 @@ REPORT_FIELDS = {"execution_id", "language", "task", "status_code", "status_msg"
                  "total_correct", "runtime_ms", "memory_mb", "test_results", "failed_testcase",
                  "compile_error", "runtime_error", "internal_error", "calibration", "created_at"}
 OUTPUT_CAP = 262144     # MAX_OUTPUT_BYTES default
+# CPU an empty jail costs before the program's own clock starts (nsjail, runtime
+# startup under systrap). Ticket 13 subtracts it; until then tests allow for it.
+JAIL_CPU_OVERHEAD_MS = 500
 
 executor = None
 
@@ -33,20 +36,154 @@ def tearDownModule():
     executor.__exit__()
 
 
-def python_job(user_code, driver_code=F_DRIVER, task="SUBMIT_CODE", time_limit=1000,
-               memory_limit=64, test_cases=({"input": "", "expectedOutput": "42"},), **extra):
-    return dict(job_id=f"seam-a-{os.urandom(4).hex()}", language="python", user_code=user_code,
+def job(language, user_code, driver_code, task="SUBMIT_CODE", time_limit=1000,
+        memory_limit=64, test_cases=({"input": "", "expectedOutput": "42"},), **extra):
+    return dict(job_id=f"seam-a-{os.urandom(4).hex()}", language=language, user_code=user_code,
                 driver_code=driver_code, task=task, time_limit=time_limit,
                 memory_limit=memory_limit, test_cases=list(test_cases), **extra)
 
 
-class TestPythonVerdicts(unittest.TestCase):
+def python_job(user_code, driver_code=F_DRIVER, **kw):
+    return job("python", user_code, driver_code, **kw)
+
+
+CPP_DRIVER = '#include <iostream>\n#include "solution.cpp"\nint main(){ std::cout << f() << std::endl; }\n'
+JAVA_DRIVER = "public class Main { public static void main(String[] a){ System.out.println(Solution.f()); } }\n"
+
+
+def java_solution(body):
+    return "public class Solution { static int f() { " + body + " } }\n"
+
+
+# Per language: its driver and one solution per verdict. "MLE-cgroup" is killed by the
+# executor's memory watch, so stderr carries no runtime marker; "MLE-runtime" is the
+# runtime's own out-of-memory error, so it does.
+MATRIX = {
+    "python": (F_DRIVER, {
+        "ACC": "def f():\n    return 42\n",
+        "WA": "def f():\n    return 41\n",
+        "TLE": "def f():\n    while True: pass\n",
+        "MLE-cgroup": "def f():\n    x = ' ' * (200 << 20)\n    return 42 if x else 0\n",
+        "MLE-runtime": "def f():\n    x = 'x' * 10**12\n    return 42\n",
+        "RE": "def f():\n    raise ValueError('boom')\n",
+        "CE": "def f(:\n    return 42\n",
+    }),
+    "cpp": (CPP_DRIVER, {
+        "ACC": "int f() { return 42; }\n",
+        "WA": "int f() { return 41; }\n",
+        "TLE": "int f() { volatile long i = 0; while (true) i++; }\n",
+        "MLE-cgroup": "#include <vector>\nint f() { std::vector<char> v(200 << 20, 1);"
+                      " volatile char* p = v.data(); return p[100 << 20] + 41; }\n",
+        "MLE-runtime": "#include <cstddef>\nint f() { volatile std::size_t n = 1ULL << 40;"
+                       " volatile char* p = new char[n]; p[0] = 1; return 42; }\n",
+        "RE": "int f() { volatile int* p = nullptr; *p = 1; return 42; }\n",
+        "CE": "int f( { return 42; }\n",
+    }),
+    "java": (JAVA_DRIVER, {
+        "ACC": java_solution("return 42;"),
+        "WA": java_solution("return 41;"),
+        "TLE": java_solution("while (true) {}"),
+        "MLE-cgroup": java_solution("java.util.List<byte[]> l = new java.util.ArrayList<>();"
+                                    " for (int i = 0; i < 1000; i++) l.add(new byte[1 << 20]);"
+                                    " return l.size() > 0 ? 42 : 0;"),
+        "MLE-runtime": java_solution("long[] a = new long[Integer.MAX_VALUE - 8]; return a.length > 0 ? 42 : 0;"),
+        "RE": java_solution("throw new RuntimeException(\"boom\");"),
+        "CE": java_solution("return 42"),
+    }),
+}
+OOM_MARKERS = {"python": "MemoryError", "cpp": "std::bad_alloc", "java": "java.lang.OutOfMemoryError"}
+
+
+class Verdicts(unittest.TestCase):
     def verdict(self, response, want):
         self.assertEqual(response["status"], "COMPLETED", response)
         report = response["report"]
         self.assertEqual(set(report), REPORT_FIELDS)        # today's report shape
         self.assertEqual(report["status_code"], want, report)
         return report
+
+
+class TestVerdictMatrix(Verdicts):
+    def test_every_verdict_in_every_language(self):
+        for language, (driver, solutions) in MATRIX.items():
+            for case, solution in solutions.items():
+                with self.subTest(language=language, case=case):
+                    report = self.verdict(executor.run_job(**job(language, solution, driver)),
+                                          case.split("-")[0])
+                    stderr = (report["failed_testcase"] or {}).get("stderr") or ""
+                    if case == "MLE-runtime":
+                        self.assertIn(OOM_MARKERS[language], stderr)
+                    if case == "MLE-cgroup":
+                        self.assertNotIn(OOM_MARKERS[language], stderr)
+                    if case == "CE":
+                        self.assertTrue(report["compile_error"])
+
+
+class TestCpp(Verdicts):
+    def test_driver_including_the_solution_links_without_duplicate_symbols(self):
+        # Compiling solution.cpp on its own as well would define f and counter twice.
+        solution = "int counter = 41;\nint f() { return counter + 1; }\n"
+        self.verdict(executor.run_job(**job("cpp", solution, CPP_DRIVER)), "ACC")
+
+    def test_cpp20_features_compile(self):
+        solution = ("#include <concepts>\n#include <ranges>\n#include <vector>\n"
+                    "template <std::integral T> T twice(T x) { return 2 * x; }\n"
+                    "int f() { std::vector<int> v{-1, 20, 1}; int s = 0;\n"
+                    "  for (int x : v | std::views::filter([](int x) { return x > 0; })) s += twice(x);\n"
+                    "  return s; }\n")
+        self.verdict(executor.run_job(**job("cpp", solution, CPP_DRIVER)), "ACC")
+
+    def test_segfault_names_the_signal(self):
+        report = self.verdict(executor.run_job(**job("cpp", MATRIX["cpp"][1]["RE"], CPP_DRIVER)), "RE")
+        self.assertIn("SIGSEGV", report["runtime_error"])
+
+    def test_unlisted_syscall_is_forbidden(self):
+        solution = "#include <sched.h>\nint f() { unshare(0); return 42; }\n"
+        report = self.verdict(executor.run_job(**job("cpp", solution, CPP_DRIVER)), "RE")
+        self.assertIn("forbidden syscall", report["runtime_error"])
+
+
+class TestJava(Verdicts):
+    def test_64_mb_of_arrays_fits_a_128_mb_budget(self):
+        solution = java_solution("int[][] a = new int[64][];"
+                                 " for (int i = 0; i < 64; i++) a[i] = new int[262144]; return 42;")
+        self.verdict(executor.run_job(**job("java", solution, JAVA_DRIVER, time_limit=5000,
+                                            memory_limit=128)), "ACC")
+
+    def test_cpu_time_of_a_single_threaded_workload_is_not_inflated(self):
+        # Allocation-heavy, so a parallel collector would burn CPU on other cores.
+        # The driver prints the JVM's uptime (its wall time) before the answer.
+        solution = java_solution(
+            "long end = System.nanoTime() + 1_500_000_000L, s = 0;"
+            " while (System.nanoTime() < end) { java.util.List<Integer> l = new java.util.ArrayList<>();"
+            " for (int i = 0; i < 10000; i++) l.add(i); s += l.size(); }"
+            " return s > 0 ? 42 : 0;")
+        driver = ("public class Main { public static void main(String[] a) { int r = Solution.f();"
+                  " System.out.println(\"uptime_ms \" + java.lang.management.ManagementFactory"
+                  ".getRuntimeMXBean().getUptime()); System.out.println(r); } }\n")
+        report = self.verdict(executor.run_job(**job("java", solution, driver, task="RUN_CODE",
+                                                     time_limit=5000, memory_limit=128)), "ACC")
+        uptime_ms = int(report["test_results"][0]["std_output"].split()[-1])
+        self.assertGreaterEqual(uptime_ms, 1500)
+        self.assertLessEqual(report["runtime_ms"], uptime_ms + JAIL_CPU_OVERHEAD_MS, report["runtime_ms"])
+
+
+class TestPythonVerdicts(Verdicts):
+    def test_syntax_error_is_a_compile_error_with_the_interpreters_message(self):
+        report = self.verdict(executor.run_job(**python_job("def f(:\n    return 42\n")), "CE")
+        self.assertIn("solution.py", report["compile_error"])
+        self.assertIn("SyntaxError", report["compile_error"])
+
+    def test_memory_marker_after_a_lot_of_stderr_is_still_memory_limit_exceeded(self):
+        # stderr keeps its tail, where the marker is.
+        self.verdict(executor.run_job(**python_job(
+            "import sys\ndef f():\n    sys.stderr.write('e' * 300000 + '\\n')\n    x = 'x' * (10**12)\n"
+            "    return 42\n")), "MLE")
+
+    def test_time_limit_keeps_partial_output(self):
+        report = self.verdict(executor.run_job(**python_job(
+            "def f():\n    print('debug marker 123')\n    while True: pass\n")), "TLE")
+        self.assertIn("debug marker 123", report["failed_testcase"]["std_output"])
 
     def test_submit_accepted(self):
         report = self.verdict(executor.run_job(**python_job(ADD, ADD_DRIVER, test_cases=CASES)), "ACC")
@@ -76,7 +213,7 @@ class TestPythonVerdicts(unittest.TestCase):
 
     def test_unlisted_syscall_is_forbidden(self):
         report = self.verdict(executor.run_job(**python_job(
-            "import ctypes\ndef f():\n    ctypes.CDLL(None).syscall(309)\n    return 42\n")), "RE")
+            "import ctypes\ndef f():\n    ctypes.CDLL(None).syscall(165)\n    return 42\n")), "RE")   # mount
         self.assertIn("forbidden syscall", report["runtime_error"])
 
     def test_cpu_loop_is_time_limit_exceeded(self):
@@ -119,9 +256,11 @@ class TestPythonVerdicts(unittest.TestCase):
             "def f():\n    x = ' ' * (200 * 1024 * 1024)\n    return 42 if x else 0\n",
             memory_limit=128, time_limit=5000)), "MLE")
 
-    def test_stdout_flood_is_output_limit_exceeded(self):
+    def test_stdout_flood_is_output_limit_exceeded_quickly(self):
+        started = time.monotonic()
         self.verdict(executor.run_job(**python_job(
             "def f():\n    while True: print('x' * 65536)\n")), "OLE")
+        self.assertLess(time.monotonic() - started, 3)   # cut at the cap, not at the time limit
 
     def test_stdout_just_under_the_cap_is_judged(self):
         self.verdict(executor.run_job(**python_job(
@@ -152,6 +291,11 @@ class TestWorkerFailures(unittest.TestCase):
         self.assertWorkerFailure(executor.send(b"\n"))
         response = executor.run_job(**python_job(ADD, ADD_DRIVER, test_cases=CASES))
         self.assertEqual(response["report"]["status_code"], "ACC", response)
+
+    def test_too_many_test_cases(self):
+        response = executor.run_job(**python_job(ADD, ADD_DRIVER, test_cases=CASES * 26))   # 52 > 50
+        self.assertWorkerFailure(response)
+        self.assertIn("52", response["error"])
 
     def test_unsupported_language(self):
         job = python_job(ADD, ADD_DRIVER, test_cases=CASES)

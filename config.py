@@ -60,7 +60,6 @@ class SandboxConfig:
     nsjail_path: str = ""
     run_config_path: str = ""             # Jail profile for running user code
     compile_config_path: str = ""         # Jail profile for the compiler
-    java_path: str = "/usr/lib/jvm/java-11-openjdk-amd64/bin/java"
 
 
 @dataclass
@@ -160,7 +159,6 @@ def load_config(env_file: Optional[str]) -> WorkerConfig:
         os.environ.get("NSJAIL_CONFIG_PATH", s.run_config_path),
     )
     s.compile_config_path = os.environ.get("NSJAIL_COMPILE_CONFIG_PATH", s.compile_config_path)
-    s.java_path = os.environ.get("JAVA_PATH", s.java_path)
 
     # --- Execution ---
     e = c.execution

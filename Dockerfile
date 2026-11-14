@@ -15,9 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && make -C /nsjail -j2
 
 FROM ubuntu:24.04
-# python3 is 3.12 on 24.04.
+# Toolchains, pinned by major version through the 24.04 package names: Python 3.12
+# (python3), GCC 13 (g++-13, with the static libc and libstdc++), Java 21.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 libnl-route-3-200 libprotobuf32t64 \
+        python3 g++-13 openjdk-21-jdk-headless libnl-route-3-200 libprotobuf32t64 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=nsjail /nsjail/nsjail /usr/local/bin/nsjail
 

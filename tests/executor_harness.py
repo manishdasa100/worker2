@@ -35,7 +35,10 @@ class ExecutorContainer:
         subprocess.run(["docker", "build", "-q", "--network=host", "-t", IMAGE, ROOT],
                        check=True, stdout=subprocess.DEVNULL)
         self.container = subprocess.run(
+            # Slot 0's core, as in production (spec: slot i pinned to core i+1);
+            # unpinned, JIT threads run in parallel and CPU time outgrows wall time.
             ["docker", "run", "-d", "--rm", f"--runtime={RUNTIME}", "--network=none",
+             f"--cpuset-cpus={min(1, os.cpu_count() - 1)}",
              "-v", f"{self.dir}:/run/executor", IMAGE],
             check=True, capture_output=True, text=True).stdout.strip()
         deadline = time.monotonic() + STARTUP_TIMEOUT_S

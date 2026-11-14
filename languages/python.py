@@ -5,7 +5,9 @@ from languages.base import BaseLanguage
 
 class PythonLanguage(BaseLanguage):
     """
-    Layout in code_dir:  solution.py (user), main.py (driver). Interpreted — no compile.
+    Layout in code_dir:  solution.py (user), main.py (driver). The compile step
+    only checks syntax (byte-compiling, nothing runs), so a syntax error is a
+    Compile Error carrying the interpreter's message.
     """
     # CPython ~3x compiled C++ on typical judge work; interpreter ~10-15 MB baseline.
     time_multiplier = 3.0
@@ -24,7 +26,8 @@ class PythonLanguage(BaseLanguage):
             f.write(driver_code)
 
     def compile_command(self) -> Optional[List[str]]:
-        return None
+        # Leaves the .pyc files in /code, where the run phase's import reuses them.
+        return ["/usr/bin/python3", "-m", "py_compile", "main.py", "solution.py"]
 
     def run_command(self, memory_limit_mb: int) -> List[str]:
         # -u: unbuffered, so debug prints survive a TLE/MLE SIGKILL and reach the report.

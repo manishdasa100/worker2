@@ -28,10 +28,10 @@ class CppLanguage(BaseLanguage):
     def compile_command(self) -> Optional[List[str]]:
         # Runs inside the compile jail with cwd=/code (relative paths resolve there).
         # Writes /code/main, which the run jail then executes read-only.
-        return ["/usr/bin/g++", "-std=c++17", "-O2", "-o", "main", "main.cpp"]
+        return ["/usr/bin/g++-13", "-std=gnu++20", "-O2", "-static", "-o", "main", "main.cpp"]
 
     def run_command(self, memory_limit_mb: int) -> List[str]:
         return ["/code/main"]
 
     def version_command(self) -> List[str]:
-        return ["/usr/bin/g++", "--version"]
+        return ["/usr/bin/g++-13", "--version"]
