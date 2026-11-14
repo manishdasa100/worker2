@@ -127,17 +127,6 @@ def f():
 """,
 }
 
-# Probes judged by verdict, not answer line:
-#   seccomp default-deny: call an unlisted-but-harmless syscall (getcpu, nr 309)
-#   via ctypes -> KILL_PROCESS -> verdict RE. Proves the allow-list denies by default.
-SECCOMP_KILL = """
-import ctypes
-def f():
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.syscall(309)          # getcpu: read-only, harmless, NOT in the allow-list
-    return 'OPEN:survived-unlisted-syscall'
-"""
-
 # Fork-bomb containment: bounded spawn; pids.max must cap it and the worker must
 # survive (a later job still runs).
 FORK_BOMB = """
@@ -189,13 +178,6 @@ async def main():
         ans = answer_line(report)
         leaked = "OPEN:" in ans
         check(name, not leaked, f"[{report.status_code}] {ans.strip()[:70]}")
-
-    # seccomp default-deny: calling an unlisted syscall must kill the process (RE),
-    # and must NOT print the 'survived' sentinel.
-    report = await run(judge, "seccomp-default-deny", SECCOMP_KILL)
-    ans = answer_line(report)
-    killed = report.status_code in ("RE", "IE") and "survived" not in ans
-    check("seccomp-default-deny", killed, f"[{report.status_code}] {ans.strip()[:60]}")
 
     # compile-time file read (the worker1 hole): a C++ source that #includes a
     # host file must FAIL to compile (CE) WITHOUT the file's contents leaking

@@ -6,10 +6,11 @@ nothing about languages, test cases, or verdicts — it takes a command,
 isolates it, and returns timing/memory/exit facts.
 
 Two profiles share one invocation path:
-  * run     — user code. Code dir read-only, default-deny seccomp
-              (sandbox/run.cfg). This is the TLE/MLE-judged path.
+  * run     — user code. Code dir read-only, seccomp allowlist with threads
+              only (sandbox/run.cfg, run.kafel). This is the TLE/MLE-judged path.
   * compile — the compiler. Code dir READ-WRITE (it emits the binary/classes),
-              not wrapped, looser seccomp (sandbox/compile.cfg). Crucially the
+              not wrapped, the allowlist plus process creation
+              (sandbox/compile.cfg, compile.kafel). Crucially the
               compiler sees only the toolchain + code dir and no network, so a
               malicious source cannot read host files (`#include "/etc/..."`)
               or exhaust host RAM at compile time — the jail's cgroup bounds it.

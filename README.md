@@ -36,7 +36,8 @@ calibrate.py   CALIBRATE: measure reference + slow/hog gap verification
 sandbox.py     nsjail wrapper; run + compile profiles; CPU-ms TLE, cgroup metrics
 cgroups.py     per-jail cgroups on runsc's v1 cgroupfs
 languages/     declarative handlers (write_files / compile_command / run_command)
-sandbox/       run.cfg (default-deny seccomp) + compile.cfg (sandboxed compiler)
+sandbox/       run.cfg + compile.cfg (jail profiles), run.kafel + compile.kafel (seccomp)
+tools/         profile_syscalls.py: strace the toolchains to re-check the seccomp policies
 ```
 
 Separation of concerns is the structural change from worker1: transport,
@@ -57,8 +58,8 @@ root in its container; jails map to uid 65534.
 | Memory / MLE | executor polls the jail cgroup's usage and kills past the limit (gVisor accounts memory but does not enforce it) |
 | Processes / fork bombs | cgroup `pids.max` + `rlimit_nproc` |
 | Output / disk | output cap + `rlimit_fsize` |
-| Syscalls (user code) | **default-deny** seccomp allow-list (`KILL_PROCESS`) |
-| Syscalls (compiler) | denylist (`EPERM`) — it legitimately forks `cc1`/`as`/`ld` |
+| Syscalls (user code) | seccomp allowlist `sandbox/run.kafel`: unlisted → `ENOSYS`, dangerous (ptrace, mount, unshare, bpf, ...) → killed, threads only (`fork` → `EAGAIN`), no sockets, `ioctl` allowlist on all 64 bits |
+| Syscalls (compiler) | `sandbox/compile.kafel`: the same, plus process creation (never new namespaces) for `cc1`/`as`/`ld` |
 
 **Biggest fix over worker1:** worker1 compiled on the host, so a submission's
 `#include "/host/path"` leaked file contents through compiler diagnostics.
@@ -66,10 +67,10 @@ worker2 compiles inside `compile.cfg` — the host FS simply isn't present, so
 `#include "/etc/passwd"` fails with "No such file or directory". Compile bombs
 are bounded by the compile jail's cgroup too.
 
-**Known ceiling:** `clone3` (JVM threads) can't be flag-filtered by seccomp, so
-creating a *nested* user namespace isn't blocked. It grants no host privileges,
-and `unshare`/`setns` are killed. Prod hardening: set `user.max_user_namespaces=0`
-on the host.
+`clone3` returns `ENOSYS`, so glibc falls back to `clone`, whose flags seccomp
+can check: namespace flags are refused in both phases. After a base-image,
+toolchain or gVisor upgrade, re-run `tools/profile_syscalls.py` and review the
+syscalls it lists as not named by a policy.
 
 ### Redis credentials
 
@@ -125,10 +126,11 @@ cp .env.example .env.dev    # Redis + EXECUTOR_SOCKETS
 .venv/bin/python -m unittest tests.test_consumer
 
 # Seam A: builds the image, starts an executor under runsc-executor, talks to its socket
-.venv/bin/python -m unittest tests.test_executor
+.venv/bin/python -m unittest tests.test_executor tests.test_adversarial
 ```
 
 `tests/verdict_matrix.py` and `tests/security.py` drive the judge in-process
 and are parked until tickets 07 and 09 move them onto Seam A. `tests/security.py` asserts containment of: host-file reads, filesystem escapes,
 worker-secret/`/proc` leakage, outbound network, privilege escalation, disk fill,
-fork bombs, default-deny seccomp, and the compile-time file-read hole.
+fork bombs, and the compile-time file-read hole. Seccomp containment is in
+`tests/test_adversarial.py`.

@@ -137,7 +137,7 @@ class TestCpp(Verdicts):
         report = self.verdict(executor.run_job(**job("cpp", MATRIX["cpp"][1]["RE"], CPP_DRIVER)), "RE")
         self.assertIn("SIGSEGV", report["runtime_error"])
 
-    def test_unlisted_syscall_is_forbidden(self):
+    def test_forbidden_syscall_is_a_runtime_error(self):
         solution = "#include <sched.h>\nint f() { unshare(0); return 42; }\n"
         report = self.verdict(executor.run_job(**job("cpp", solution, CPP_DRIVER)), "RE")
         self.assertIn("forbidden syscall", report["runtime_error"])
@@ -211,7 +211,7 @@ class TestPythonVerdicts(Verdicts):
             "import sys\ndef f():\n    sys.exit(139)\n")), "RE")
         self.assertIn("exit code 139", report["runtime_error"])
 
-    def test_unlisted_syscall_is_forbidden(self):
+    def test_forbidden_syscall_is_a_runtime_error(self):
         report = self.verdict(executor.run_job(**python_job(
             "import ctypes\ndef f():\n    ctypes.CDLL(None).syscall(165)\n    return 42\n")), "RE")   # mount
         self.assertIn("forbidden syscall", report["runtime_error"])
