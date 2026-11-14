@@ -23,6 +23,7 @@ import cgroups
 from config import load_config
 from judge import Judge
 from models import WORKER_FAILURE_CODES, ExecutionRequest
+from sandbox import workspace
 
 logger = logging.getLogger("executor")
 
@@ -77,7 +78,6 @@ def failed(error: str) -> dict:
 
 async def serve(path: str) -> None:
     config = load_config(env_file=None)
-    os.makedirs(config.execution.temp_dir, exist_ok=True)
     executor = Executor(Judge(config))
     await executor.judge.warmup()   # ticket 13's self-test smoke runs replace this
     if os.path.exists(path):
@@ -94,6 +94,8 @@ def main() -> None:
                         format="[%(asctime)s] %(levelname)-7s %(name)-10s %(message)s")
     try:
         cgroups.require()
+        with workspace():   # refuse to start if job workspaces can't be mounted
+            pass
     except RuntimeError as e:
         logger.error("Refusing to start: %s", e)
         sys.exit(1)

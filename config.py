@@ -60,6 +60,7 @@ class SandboxConfig:
     nsjail_path: str = ""
     run_config_path: str = ""             # Jail profile for running user code
     compile_config_path: str = ""         # Jail profile for the compiler
+    jail_uid: int = 61001                 # This slot's host uid (>= 61000, owns nothing) jails map to
 
 
 @dataclass
@@ -69,7 +70,6 @@ class ExecutionConfig:
     max_output_bytes: int = 262144        # 256 KB output cap
     max_output_lines: int = 5000
     max_testcases: int = 50               # Worker backstop on job duration
-    temp_dir: str = "/tmp/codinglemons"
 
     # --- Sandboxed compilation (NEW in worker2) ---
     # The compiler runs inside a jail with only the toolchain + code dir
@@ -114,6 +114,7 @@ def load_config(env_file: Optional[str]) -> WorkerConfig:
         COMPILE_TIMEOUT, COMPILE_MEMORY_LIMIT  — sandboxed-compile budgets
         NSJAIL_RUN_CONFIG_PATH                 — runtime jail profile
         NSJAIL_COMPILE_CONFIG_PATH             — compile jail profile
+        JAIL_UID                               — the slot's host uid jails run as
     NSJAIL_CONFIG_PATH (worker1's single profile) is still accepted as a
     fallback for the run profile.
 
@@ -159,6 +160,9 @@ def load_config(env_file: Optional[str]) -> WorkerConfig:
         os.environ.get("NSJAIL_CONFIG_PATH", s.run_config_path),
     )
     s.compile_config_path = os.environ.get("NSJAIL_COMPILE_CONFIG_PATH", s.compile_config_path)
+    s.jail_uid = _int("JAIL_UID", s.jail_uid)
+    if s.jail_uid < 61000:
+        raise SystemExit(f"[config] JAIL_UID must be a dedicated uid >= 61000, got {s.jail_uid}")
 
     # --- Execution ---
     e = c.execution
@@ -167,7 +171,6 @@ def load_config(env_file: Optional[str]) -> WorkerConfig:
     e.max_output_bytes = _int("MAX_OUTPUT_BYTES", e.max_output_bytes)
     e.max_output_lines = _int("MAX_OUTPUT_LINES", e.max_output_lines)
     e.max_testcases = _int("MAX_TESTCASES", e.max_testcases)
-    e.temp_dir = os.environ.get("TEMP_DIR", e.temp_dir)
     e.compile_timeout = _int("COMPILE_TIMEOUT", _int("COMPILATION_TIMEOUT", e.compile_timeout))
     e.compile_memory_limit = _int("COMPILE_MEMORY_LIMIT", e.compile_memory_limit)
     e.calibration_runs = _int("CALIBRATION_RUNS", e.calibration_runs)

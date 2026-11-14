@@ -14,8 +14,6 @@ sandbox.compile() instead of a host subprocess.
 import asyncio
 import logging
 import math
-import os
-import shutil
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -29,7 +27,7 @@ from models import (
     TestCaseResult,
     TestStatus,
 )
-from sandbox import NsjailSandbox, SandboxResult
+from sandbox import NsjailSandbox, SandboxResult, workspace
 
 logger = logging.getLogger(__name__)
 
@@ -67,24 +65,21 @@ class Judge:
             if name not in WARMUP_PROGRAMS:
                 continue
             user_code, driver_code = WARMUP_PROGRAMS[name]
-            warm_dir = os.path.join(self.config.execution.temp_dir, f"warmup_{name}_{os.getpid()}")
             try:
-                os.makedirs(warm_dir, exist_ok=True)
-                lang.write_files(warm_dir, user_code, driver_code)
-                outcome = await self._compile(lang, warm_dir)
-                if not outcome.ok:
-                    logger.warning("Warmup compile failed for %s: %s", name, outcome.error_message[:200])
-                    continue
-                result = await self.sandbox.run(
-                    command=lang.run_command(256), code_dir=warm_dir,
-                    time_limit_ms=10000, memory_limit=256)
-                if result.exit_code != 0:
-                    logger.warning("Warmup run failed for %s (exit=%d): %s",
-                                   name, result.exit_code, result.stderr.strip()[:200])
+                with workspace() as warm_dir:
+                    lang.write_files(warm_dir, user_code, driver_code)
+                    outcome = await self._compile(lang, warm_dir)
+                    if not outcome.ok:
+                        logger.warning("Warmup compile failed for %s: %s", name, outcome.error_message[:200])
+                        continue
+                    result = await self.sandbox.run(
+                        command=lang.run_command(256), code_dir=warm_dir, toolchain=lang.run_toolchain,
+                        time_limit_ms=10000, memory_limit=256)
+                    if result.exit_code != 0:
+                        logger.warning("Warmup run failed for %s (exit=%d): %s",
+                                       name, result.exit_code, result.stderr.strip()[:200])
             except Exception as e:
                 logger.warning("Warmup for %s failed: %s", name, e)
-            finally:
-                shutil.rmtree(warm_dir, ignore_errors=True)
         logger.info("Language runtimes warmed in %dms", int((time.monotonic() - started) * 1000))
 
     # ---- compile (sandboxed) ------------------------------------------------
@@ -104,7 +99,7 @@ class Judge:
 
         started = time.monotonic()
         sr = await self.sandbox.compile(
-            command=command, code_dir=code_dir,
+            command=command, code_dir=code_dir, toolchain=lang.compile_toolchain,
             time_limit_ms=self.config.execution.compile_timeout * 1000,
             memory_limit=self.config.execution.compile_memory_limit,
         )
@@ -144,51 +139,48 @@ class Judge:
                                      f"limit of {self.config.execution.max_testcases}")
             return report
 
-        exec_dir = os.path.join(self.config.execution.temp_dir, f"exec_{job_id}")
-        code_dir = os.path.join(exec_dir, "code")
         try:
-            os.makedirs(code_dir, exist_ok=True)
-            lang.write_files(code_dir, request.user_code, request.driver_code)
+            with workspace() as code_dir:
+                lang.write_files(code_dir, request.user_code, request.driver_code)
 
-            outcome = await self._compile(lang, code_dir)
-            if not outcome.ok:
-                logger.info("[%s] Compilation failed", job_id)
-                report = self._error_report(request, StatusCode.COMPILE_ERROR, "Compilation error")
-                report.compile_error = outcome.error_message
+                outcome = await self._compile(lang, code_dir)
+                if not outcome.ok:
+                    logger.info("[%s] Compilation failed", job_id)
+                    report = self._error_report(request, StatusCode.COMPILE_ERROR, "Compilation error")
+                    report.compile_error = outcome.error_message
+                    return report
+
+                if request.task == "CALIBRATE":
+                    from calibrate import Calibrator
+                    time_limit_ms = self.config.execution.calibration_time_limit * 1000
+                    memory_limit = self.config.execution.calibration_memory_limit
+                    logger.info("[%s] Calibration limits: time %dms, memory %dMB",
+                                job_id, time_limit_ms, memory_limit)
+                    return await Calibrator(self).run(
+                        request=request, lang=lang, command=lang.run_command(memory_limit),
+                        code_dir=code_dir, time_limit_ms=time_limit_ms,
+                        memory_limit=memory_limit, compile_ms=outcome.compile_ms)
+
+                time_limit_ms, memory_limit = self._resolve_limits(request, lang)
+                logger.info("[%s] Limits: cpu %dms, memory %dMB", job_id, time_limit_ms, memory_limit)
+
+                test_results = await self._run_test_cases(
+                    job_id=job_id, command=lang.run_command(memory_limit), code_dir=code_dir,
+                    toolchain=lang.run_toolchain,
+                    test_cases=request.test_cases, time_limit_ms=time_limit_ms,
+                    memory_limit=memory_limit, oom_markers=lang.oom_error_markers,
+                    stop_on_failure=(request.task == "SUBMIT_CODE"))
+
+                report = self._build_report(request, test_results)
+                logger.info("[%s] Complete: status=%s, passed=%d/%d", job_id,
+                            report.status_msg, report.total_correct, report.total_testcases)
                 return report
-
-            if request.task == "CALIBRATE":
-                from calibrate import Calibrator
-                time_limit_ms = self.config.execution.calibration_time_limit * 1000
-                memory_limit = self.config.execution.calibration_memory_limit
-                logger.info("[%s] Calibration limits: time %dms, memory %dMB",
-                            job_id, time_limit_ms, memory_limit)
-                return await Calibrator(self).run(
-                    request=request, lang=lang, command=lang.run_command(memory_limit),
-                    code_dir=code_dir, time_limit_ms=time_limit_ms,
-                    memory_limit=memory_limit, compile_ms=outcome.compile_ms)
-
-            time_limit_ms, memory_limit = self._resolve_limits(request, lang)
-            logger.info("[%s] Limits: cpu %dms, memory %dMB", job_id, time_limit_ms, memory_limit)
-
-            test_results = await self._run_test_cases(
-                job_id=job_id, command=lang.run_command(memory_limit), code_dir=code_dir,
-                test_cases=request.test_cases, time_limit_ms=time_limit_ms,
-                memory_limit=memory_limit, oom_markers=lang.oom_error_markers,
-                stop_on_failure=(request.task == "SUBMIT_CODE"))
-
-            report = self._build_report(request, test_results)
-            logger.info("[%s] Complete: status=%s, passed=%d/%d", job_id,
-                        report.status_msg, report.total_correct, report.total_testcases)
-            return report
 
         except Exception as e:
             logger.exception("[%s] Internal error during judging", job_id)
             report = self._error_report(request, StatusCode.INTERNAL_ERROR, "Internal execution error")
             report.internal_error = str(e)
             return report
-        finally:
-            shutil.rmtree(exec_dir, ignore_errors=True)
 
     def _resolve_limits(self, request: ExecutionRequest, lang) -> Tuple[int, int]:
         """
@@ -204,13 +196,13 @@ class Judge:
 
     # ---- running + classification (preserved from worker1) ------------------
 
-    async def _run_test_cases(self, job_id, command, code_dir, test_cases, time_limit_ms,
+    async def _run_test_cases(self, job_id, command, code_dir, toolchain, test_cases, time_limit_ms,
                               memory_limit, oom_markers, stop_on_failure) -> List[TestCaseResult]:
         results = []
         for i, test_case in enumerate(test_cases):
             input_data = test_case.get("input", "")
             expected_output = test_case.get("expectedOutput", "").strip()
-            sr = await self.sandbox.run(command=command, code_dir=code_dir, stdin_data=input_data,
+            sr = await self.sandbox.run(command=command, code_dir=code_dir, toolchain=toolchain, stdin_data=input_data,
                                         time_limit_ms=time_limit_ms, memory_limit=memory_limit)
             tc = self._evaluate_test_case(i, sr, input_data, expected_output, oom_markers)
             results.append(tc)

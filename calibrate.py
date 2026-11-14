@@ -87,7 +87,8 @@ class Calibrator:
             logger.info("[%s] Calibrating %s test case %d/%d (%d runs)",
                         job_id, label, i + 1, len(test_cases), runs)
             for run_no in range(1, runs + 1):
-                sr = await self.sandbox.run(command=command, code_dir=code_dir, stdin_data=input_data,
+                sr = await self.sandbox.run(command=command, code_dir=code_dir, toolchain=lang.run_toolchain,
+                                            stdin_data=input_data,
                                             time_limit_ms=time_limit_ms, memory_limit=memory_limit)
                 tc = self.judge._evaluate_test_case(i, sr, input_data, expected, lang.oom_error_markers)
                 entry["samples"].append({"run": run_no, "runtime_ms": sr.runtime_ms, "driver_ms": sr.driver_ms,

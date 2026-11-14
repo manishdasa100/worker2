@@ -1,6 +1,9 @@
 from typing import List, Optional
 
-from languages.base import BaseLanguage
+from languages.base import BaseLanguage, SHARED_LIBS, Toolchain
+
+# The bind follows the symlink, so the jail's /usr/bin/python3 is the interpreter itself.
+TOOLCHAIN = Toolchain(mounts=("/usr/bin/python3", "/usr/lib/python3.12", *SHARED_LIBS))
 
 
 class PythonLanguage(BaseLanguage):
@@ -9,6 +12,8 @@ class PythonLanguage(BaseLanguage):
     only checks syntax (byte-compiling, nothing runs), so a syntax error is a
     Compile Error carrying the interpreter's message.
     """
+    compile_toolchain = TOOLCHAIN
+    run_toolchain = TOOLCHAIN
     # CPython ~3x compiled C++ on typical judge work; interpreter ~10-15 MB baseline.
     time_multiplier = 3.0
     memory_baseline_mb = 16

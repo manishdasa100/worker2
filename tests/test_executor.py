@@ -142,6 +142,17 @@ class TestCpp(Verdicts):
         report = self.verdict(executor.run_job(**job("cpp", solution, CPP_DRIVER)), "RE")
         self.assertIn("forbidden syscall", report["runtime_error"])
 
+    def test_recursive_dfs_of_depth_100000_fits_a_128_mb_budget(self):
+        # ~300 bytes a frame: about 30 MB of stack, far past the usual 8 MB default.
+        solution = ("#include <vector>\nstd::vector<std::vector<int>> adj;\n"
+                    "int depth(int u, int p) { volatile char frame[256]; frame[0] = 0; int best = 0;\n"
+                    "  for (int v : adj[u]) if (v != p) { int d = depth(v, u); if (d > best) best = d; }\n"
+                    "  return best + 1 + frame[0]; }\n"
+                    "int f() { const int n = 100000; adj.assign(n, {});\n"
+                    "  for (int i = 1; i < n; i++) { adj[i - 1].push_back(i); adj[i].push_back(i - 1); }\n"
+                    "  return depth(0, -1) == n ? 42 : 0; }\n")
+        self.verdict(executor.run_job(**job("cpp", solution, CPP_DRIVER, memory_limit=128)), "ACC")
+
 
 class TestJava(Verdicts):
     def test_64_mb_of_arrays_fits_a_128_mb_budget(self):

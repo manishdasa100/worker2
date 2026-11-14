@@ -37,7 +37,8 @@ class ExecutorContainer:
         self.container = subprocess.run(
             # Slot 0's core, as in production (spec: slot i pinned to core i+1);
             # unpinned, JIT threads run in parallel and CPU time outgrows wall time.
-            ["docker", "run", "-d", "--rm", f"--runtime={RUNTIME}", "--network=none",
+            # SYS_ADMIN (gVisor's, not the host's) lets the executor mount each job's workspace.
+            ["docker", "run", "-d", "--rm", f"--runtime={RUNTIME}", "--network=none", "--cap-add=SYS_ADMIN",
              f"--cpuset-cpus={min(1, os.cpu_count() - 1)}",
              "-v", f"{self.dir}:/run/executor", IMAGE],
             check=True, capture_output=True, text=True).stdout.strip()

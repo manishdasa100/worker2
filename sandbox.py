@@ -7,7 +7,8 @@ isolates it, and returns timing/memory/exit facts.
 
 Two profiles share one invocation path:
   * run     — user code. Code dir read-only, seccomp allowlist with threads
-              only (sandbox/run.cfg, run.kafel). This is the TLE/MLE-judged path.
+              only (sandbox/run.cfg, run.kafel), stack limit = memory limit.
+              This is the TLE/MLE-judged path.
   * compile — the compiler. Code dir READ-WRITE (it emits the binary/classes),
               not wrapped, the allowlist plus process creation
               (sandbox/compile.cfg, compile.kafel). Crucially the
@@ -15,12 +16,18 @@ Two profiles share one invocation path:
               malicious source cannot read host files (`#include "/etc/..."`)
               or exhaust host RAM at compile time — the jail's cgroup bounds it.
 
+Besides the code dir, a jail sees only the toolchain its caller names: read-only
+paths and extra environment variables (nothing for a static binary). The code dir lives in a
+job's workspace(): a fresh tmpfs, size- and inode-capped, so a compile can't
+fill the disk and nothing a job writes reaches the next one.
+
 Runs as root inside the executor's runsc container (ADR-0003). nsjail joins a
 fresh per-jail cgroup before exec; while it runs, a watchdog polls the cgroup
 and kills the jail past its CPU limit, its wall limit (2 x CPU + 1 s) or its
 memory limit (gVisor accounts memory but does not enforce it), tracking the
 memory peak. nsjail's rlimit_cpu and time_limit sit a second above the watchdog
-as backstops. The jail runs as JAIL_UID, which owns nothing.
+as backstops. The jail runs as JAIL_USER, mapped to the slot's host uid
+(SandboxConfig.jail_uid), which owns nothing.
 """
 import asyncio
 import logging
@@ -28,10 +35,12 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from cgroups import JailCgroup
 from config import SandboxConfig
@@ -42,7 +51,9 @@ logger = logging.getLogger(__name__)
 STATS_MOUNT = "/stats"
 STATS_FILENAME = "stats.txt"
 
-JAIL_UID = 65534        # outside id the jail's user maps to (sandbox/*.cfg uidmap)
+JAIL_USER = 1000        # uid and gid inside every jail: "jail" in sandbox/passwd
+# ponytail: one cap for every language; per-language caps if a toolchain needs more.
+WORKSPACE_OPTIONS = "size=64m,nr_inodes=1024,mode=0755"
 WATCHDOG_POLL_S = 0.01
 RUN_PIDS_MAX = 64
 COMPILE_PIDS_MAX = 128   # compiler drivers fork
@@ -58,6 +69,33 @@ SIGXCPU = 24
 # setup failure, not the program's doing.
 _NSJAIL_EXIT = re.compile(r"\) (?:exited with status: \d+|terminated with signal: \S+ \((\d+)\))")
 _NSJAIL_LAUNCH_FAILED = "Launching child process failed"
+
+
+@contextmanager
+def workspace() -> Iterator[str]:
+    """
+    Mount a fresh tmpfs for one job and yield the code dir inside it; stats dirs
+    and calibration's adversaries go beside it, under the same cap. Mounting
+    needs CAP_SYS_ADMIN in the executor's runsc container (gVisor's, not the host's).
+    """
+    root = tempfile.mkdtemp(prefix="workspace_")
+    mounted = subprocess.run(["mount", "-t", "tmpfs", "-o", WORKSPACE_OPTIONS, "tmpfs", root],
+                             capture_output=True, text=True)
+    if mounted.returncode != 0:
+        os.rmdir(root)
+        raise RuntimeError(f"Cannot mount a job workspace (the executor needs CAP_SYS_ADMIN): "
+                           f"{mounted.stderr.strip()}")
+    try:
+        code_dir = os.path.join(root, "code")
+        os.mkdir(code_dir)
+        yield code_dir
+    finally:
+        # Every jail has exited by now, so nothing holds the mount.
+        unmounted = subprocess.run(["umount", root], capture_output=True, text=True)
+        if unmounted.returncode == 0:
+            os.rmdir(root)
+        else:
+            logger.error("Could not unmount workspace %s: %s", root, unmounted.stderr.strip())
 
 
 @dataclass
@@ -91,13 +129,14 @@ class NsjailSandbox:
         self,
         command: List[str],
         code_dir: str,
+        toolchain,
         stdin_data: str = "",
         time_limit_ms: int = 5000,
         memory_limit: int = 50,
     ) -> SandboxResult:
-        """Run user code in the read-only run profile (TLE-judged)."""
+        """Run user code in the read-only run profile (TLE-judged) with `toolchain`."""
         return await self._invoke(
-            command, code_dir,
+            command, code_dir, toolchain,
             config_path=self.config.run_config_path,
             stdin_data=stdin_data,
             time_limit_ms=time_limit_ms,
@@ -110,16 +149,17 @@ class NsjailSandbox:
         self,
         command: List[str],
         code_dir: str,
+        toolchain,
         time_limit_ms: int,
         memory_limit: int,
     ) -> SandboxResult:
         """
         Run the compiler in the writable compile profile. No network, only the
         toolchain + code dir visible, cgroup-bounded. Output lands in code_dir
-        (a host bind mount) for the run profile to use read-only afterwards.
+        for the run profile to use read-only afterwards.
         """
         return await self._invoke(
-            command, code_dir,
+            command, code_dir, toolchain,
             config_path=self.config.compile_config_path,
             stdin_data="",
             time_limit_ms=time_limit_ms,
@@ -130,39 +170,49 @@ class NsjailSandbox:
 
     # ---- shared invocation --------------------------------------------------
 
-    def _build_command(self, command, code_dir, *, config_path, rlimit_cpu_s,
-                       wall_limit_s, writable, log_file, stats_dir) -> List[str]:
+    def _build_command(self, command, code_dir, toolchain, *, config_path, rlimit_cpu_s,
+                       wall_limit_s, writable, log_file, stats_dir, stack_mb) -> List[str]:
         mount_flag = "--bindmount" if writable else "--bindmount_ro"
+        identity = f"{JAIL_USER}:{self.config.jail_uid}:1"
         cmd = [
             self.config.nsjail_path,
             "--config", config_path,
             "--log", log_file,
+            "--user", identity, "--group", identity,
             "--rlimit_cpu", str(rlimit_cpu_s),
             "--time_limit", str(wall_limit_s),
-            mount_flag, f"{code_dir}:/code",
         ]
+        if stack_mb:
+            cmd += ["--rlimit_stack", str(stack_mb)]
+        for path in toolchain.mounts:
+            cmd += ["--bindmount_ro", path]
+        for var in toolchain.env:
+            cmd += ["--env", var]
+        cmd += [mount_flag, f"{code_dir}:/code"]
         if stats_dir:
             cmd += ["--bindmount", f"{stats_dir}:{STATS_MOUNT}"]
         cmd.append("--")
         cmd += command
         return cmd
 
-    async def _invoke(self, command, code_dir, *, config_path, stdin_data,
+    async def _invoke(self, command, code_dir, toolchain, *, config_path, stdin_data,
                       time_limit_ms, memory_limit, writable, measure) -> SandboxResult:
         log_file = tempfile.NamedTemporaryFile(prefix="nsjail_log_", suffix=".txt", delete=False)
         log_path = log_file.name
         log_file.close()
 
+        jail_uid = self.config.jail_uid
         if writable:
-            os.chown(code_dir, JAIL_UID, JAIL_UID)   # the compiler writes its output there
+            os.chown(code_dir, jail_uid, jail_uid)   # the compiler writes its output there
         # +1: nsjail itself sits in the cgroup with the jail
         run_cgroup = JailCgroup.create(pids_max=(COMPILE_PIDS_MAX if writable else RUN_PIDS_MAX) + 1)
 
         stats_dir = ""
         stats_path = ""
         if measure:
-            stats_dir = tempfile.mkdtemp(prefix="nsjail_stats_")
-            os.chown(stats_dir, JAIL_UID, JAIL_UID)
+            # Beside the code dir, so the workspace's cap bounds what the program writes here.
+            stats_dir = tempfile.mkdtemp(prefix="stats_", dir=os.path.dirname(code_dir))
+            os.chown(stats_dir, jail_uid, jail_uid)
             stats_path = os.path.join(stats_dir, STATS_FILENAME)
 
         wall_limit_ms = 2 * time_limit_ms + 1000
@@ -172,9 +222,10 @@ class NsjailSandbox:
         wall_limit_s = math.ceil(wall_limit_ms / 1000) + 1
 
         nsjail_cmd = self._build_command(
-            command, code_dir, config_path=config_path, rlimit_cpu_s=rlimit_cpu_s,
+            command, code_dir, toolchain, config_path=config_path, rlimit_cpu_s=rlimit_cpu_s,
             wall_limit_s=wall_limit_s, writable=writable,
             log_file=log_path, stats_dir=stats_dir,
+            stack_mb=memory_limit if measure else None,   # the compile stack is compile.cfg's
         )
         logger.debug("nsjail: %s", " ".join(nsjail_cmd))
 

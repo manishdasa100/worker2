@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from languages.base import BaseLanguage
+from languages.base import BaseLanguage, LOADER, Toolchain
 
 
 class CppLanguage(BaseLanguage):
@@ -9,6 +9,8 @@ class CppLanguage(BaseLanguage):
     main (compiled binary). Compiled inside the jail: only main.cpp is passed to g++;
     it pulls in solution.cpp.
     """
+    compile_toolchain = Toolchain(mounts=("/usr", LOADER))
+    run_toolchain = Toolchain()   # static: the run jail holds nothing but the workspace
     # Reference language: limits are calibrated to compiled speed; no runtime baseline.
     time_multiplier = 1.0
     memory_baseline_mb = 0

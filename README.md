@@ -36,7 +36,7 @@ calibrate.py   CALIBRATE: measure reference + slow/hog gap verification
 sandbox.py     nsjail wrapper; run + compile profiles; CPU-ms TLE, cgroup metrics
 cgroups.py     per-jail cgroups on runsc's v1 cgroupfs
 languages/     declarative handlers (write_files / compile_command / run_command)
-sandbox/       run.cfg + compile.cfg (jail profiles), run.kafel + compile.kafel (seccomp)
+sandbox/       run.cfg + compile.cfg (jail profiles), run.kafel + compile.kafel (seccomp), the jails' passwd + group
 tools/         profile_syscalls.py: strace the toolchains to re-check the seccomp policies
 ```
 
@@ -47,24 +47,28 @@ judging, and sandboxing no longer bleed into each other.
 
 Every execution — **including compilation** — runs inside nsjail, inside an
 executor container under gVisor (`runsc`, `--network=none`). The executor is
-root in its container; jails map to uid 65534.
+root in its container (with gVisor's `CAP_SYS_ADMIN`, to mount workspaces); each
+jail runs as one unprivileged user mapped to the slot's own host uid
+(`JAIL_UID`, ≥ 61000, default 61001), which owns nothing.
 
 | Boundary | Enforced by |
 |---|---|
-| No host filesystem | tmpfs `/`, only `/usr` (toolchain) read-only + the code dir |
+| No host filesystem | tmpfs `/`, the language's toolchain paths read-only (none for a static binary) + the code dir; no `/proc` or `/sys`; fake `/etc/passwd` and `/etc/group`; `/dev` holds null, zero and urandom |
+| Workspace | a fresh tmpfs per job, 64 MB and 1024 inodes, unmounted afterwards: compiles can't fill the disk and nothing reaches the next job |
 | No network | empty net namespace |
 | No privileges | user namespace, `no_new_privs`, all caps dropped |
 | CPU / TLE | executor watchdog polls the jail cgroup every 10 ms and kills past the CPU limit or a wall limit of 2 × CPU + 1 s; nsjail rlimits a second above as backstop |
 | Memory / MLE | executor polls the jail cgroup's usage and kills past the limit (gVisor accounts memory but does not enforce it) |
 | Processes / fork bombs | cgroup `pids.max` + `rlimit_nproc` |
-| Output / disk | output cap + `rlimit_fsize` |
+| Output / disk | output cap + `rlimit_fsize`; a jail's `/tmp` counts against its memory |
+| rlimits | every one set per phase; run-phase stack = memory limit, so deep recursion works |
 | Syscalls (user code) | seccomp allowlist `sandbox/run.kafel`: unlisted → `ENOSYS`, dangerous (ptrace, mount, unshare, bpf, ...) → killed, threads only (`fork` → `EAGAIN`), no sockets, `ioctl` allowlist on all 64 bits |
 | Syscalls (compiler) | `sandbox/compile.kafel`: the same, plus process creation (never new namespaces) for `cc1`/`as`/`ld` |
 
 **Biggest fix over worker1:** worker1 compiled on the host, so a submission's
 `#include "/host/path"` leaked file contents through compiler diagnostics.
 worker2 compiles inside `compile.cfg` — the host FS simply isn't present, so
-`#include "/etc/passwd"` fails with "No such file or directory". Compile bombs
+`#include "/etc/shadow"` fails with "No such file or directory". Compile bombs
 are bounded by the compile jail's cgroup too.
 
 `clone3` returns `ENOSYS`, so glibc falls back to `clone`, whose flags seccomp
@@ -129,8 +133,8 @@ cp .env.example .env.dev    # Redis + EXECUTOR_SOCKETS
 .venv/bin/python -m unittest tests.test_executor tests.test_adversarial
 ```
 
-`tests/verdict_matrix.py` and `tests/security.py` drive the judge in-process
-and are parked until tickets 07 and 09 move them onto Seam A. `tests/security.py` asserts containment of: host-file reads, filesystem escapes,
-worker-secret/`/proc` leakage, outbound network, privilege escalation, disk fill,
-fork bombs, and the compile-time file-read hole. Seccomp containment is in
-`tests/test_adversarial.py`.
+`tests/verdict_matrix.py` drives the judge in-process and is parked.
+`tests/test_adversarial.py` covers containment through Seam A: seccomp in both
+phases, what each jail can see (host files, `/proc`, `/usr`, devices, the
+environment), writes outside `/tmp`, the network, setuid, disk fill, fork bombs,
+the compile-time file-read hole, the workspace cap, and leftovers between jobs.

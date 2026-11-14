@@ -13,6 +13,10 @@ relative to /code). The judge orchestrates: sandbox.compile(compile_command())
 then sandbox.run(run_command()). This is the worker2 change that closes the
 host-side compile hole: the compiler never runs on the host.
 
+What a jail of each phase gets besides the workspace, as a Toolchain:
+  compile_toolchain   — what the compile command needs.
+  run_toolchain       — what the run command needs. Static binaries need nothing.
+
 Per-language fairness knobs (applied by the judge):
   time_multiplier     — the request's time budget is calibrated for compiled
                         speed; slower runtimes get budget x this so the same
@@ -24,10 +28,23 @@ Per-language fairness knobs (applied by the judge):
                         before the cgroup OOM killer). Lets the judge class it MLE.
 """
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import List, Optional
+
+LOADER = "/lib64/ld-linux-x86-64.so.2"
+# What any dynamically linked program needs: the loader and the shared libraries.
+SHARED_LIBS = (LOADER, "/usr/lib/x86_64-linux-gnu")
+
+
+@dataclass(frozen=True)
+class Toolchain:
+    mounts: tuple = ()   # paths bound read-only, at the same path inside the jail
+    env: tuple = ()      # extra "NAME=value" variables
 
 
 class BaseLanguage(ABC):
+    compile_toolchain = Toolchain()
+    run_toolchain = Toolchain()
     time_multiplier: float = 1.0
     memory_baseline_mb: int = 0
     oom_error_markers: tuple = ()
