@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional
+from typing import List
 
 from languages.base import BaseLanguage, SHARED_LIBS, Toolchain
 
@@ -38,9 +38,9 @@ class JavaLanguage(BaseLanguage):
         with open(os.path.join(code_dir, "Main.java"), "w") as f:
             f.write(driver_code)
 
-    def compile_command(self) -> Optional[List[str]]:
+    def compile_commands(self) -> List[List[str]]:
         # cwd=/code inside the jail; writes *.class there for the run jail.
-        return [JAVAC_PATH, "Main.java", "Solution.java"]
+        return [[JAVAC_PATH, "Main.java", "Solution.java"]]
 
     def run_command(self, memory_limit_mb: int) -> List[str]:
         # -Xmx = the cgroup limit, so heap+overhead crosses the cgroup ceiling and

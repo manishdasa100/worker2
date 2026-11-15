@@ -3,14 +3,14 @@ Language handler interface.
 
 A handler is declarative — it does NOT run subprocesses. It says:
   1. how to lay source files out in the code dir   (write_files)
-  2. the command that compiles them, if any         (compile_command)
+  2. the commands that compile them, in order       (compile_commands)
   3. the command that runs them                      (run_command)
   4. how to probe its runtime version                (version_command, for CALIBRATE)
 
-Both compile_command and run_command execute INSIDE the jail (cwd=/code, the
+Compile and run commands execute INSIDE the jail (cwd=/code, the
 code dir bind-mounted there) — so paths are sandbox-internal (/code/..., or
-relative to /code). The judge orchestrates: sandbox.compile(compile_command())
-then sandbox.run(run_command()). This is the worker2 change that closes the
+relative to /code). The judge orchestrates: sandbox.compile() on each compile command
+in turn, then sandbox.run(run_command()). This is the worker2 change that closes the
 host-side compile hole: the compiler never runs on the host.
 
 What a jail of each phase gets besides the workspace, as a Toolchain:
@@ -29,7 +29,7 @@ Per-language fairness knobs (applied by the judge):
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 LOADER = "/lib64/ld-linux-x86-64.so.2"
 # What any dynamically linked program needs: the loader and the shared libraries.
@@ -59,8 +59,8 @@ class BaseLanguage(ABC):
         ...
 
     @abstractmethod
-    def compile_command(self) -> Optional[List[str]]:
-        """Command to compile inside the jail, or None for interpreted languages."""
+    def compile_commands(self) -> List[List[str]]:
+        """Compile commands, each run in a fresh compile jail over the same workspace; the first to fail ends the compile. Empty if nothing to compile."""
         ...
 
     @abstractmethod

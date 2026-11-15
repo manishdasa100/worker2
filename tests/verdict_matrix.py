@@ -32,8 +32,8 @@ class UnlaunchableRun(PythonLanguage):
 
 
 class UnlaunchableCompile(PythonLanguage):
-    def compile_command(self):
-        return ["/nonexistent"]
+    def compile_commands(self):
+        return [["/nonexistent"]]
 
 
 # nsjail setup failures must stay worker failures (IE -> FAILED).

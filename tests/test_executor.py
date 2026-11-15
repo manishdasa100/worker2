@@ -51,8 +51,16 @@ CPP_DRIVER = '#include <iostream>\n#include "solution.cpp"\nint main(){ std::cou
 JAVA_DRIVER = "public class Main { public static void main(String[] a){ System.out.println(Solution.f()); } }\n"
 
 
+C_DRIVER = '#include <stdio.h>\n#include "solution.c"\nint main(void) { printf("%d\\n", f()); return 0; }\n'
+GO_DRIVER = 'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println(f()) }\n'
+
+
 def java_solution(body):
     return "public class Solution { static int f() { " + body + " } }\n"
+
+
+def go_solution(body):
+    return "package main\n\nfunc f() int {\n" + body + "\n}\n"
 
 
 # Per language: its driver and one solution per verdict. "MLE-cgroup" is killed by the
@@ -90,8 +98,29 @@ MATRIX = {
         "RE": java_solution("throw new RuntimeException(\"boom\");"),
         "CE": java_solution("return 42"),
     }),
+    # C has no runtime out-of-memory message (malloc just returns NULL), so no MLE-runtime.
+    "c": (C_DRIVER, {
+        "ACC": "int f(void) { return 42; }\n",
+        "WA": "int f(void) { return 41; }\n",
+        "TLE": "int f(void) { volatile long i = 0; for (;;) i++; }\n",
+        "MLE-cgroup": "#include <stdlib.h>\n#include <string.h>\n"
+                      "int f(void) { char* p = malloc(200 << 20); memset(p, 1, 200 << 20);"
+                      " return ((volatile char*)p)[100 << 20] + 41; }\n",
+        "RE": "int f(void) { volatile int* p = 0; *p = 1; return 42; }\n",
+        "CE": "int f( { return 42; }\n",
+    }),
+    "go": (GO_DRIVER, {
+        "ACC": go_solution("return 42"),
+        "WA": go_solution("return 41"),
+        "TLE": go_solution("for {\n}"),
+        "MLE-cgroup": go_solution("b := make([]byte, 200<<20)\nfor i := range b {\nb[i] = 1\n}\nreturn int(b[100<<20]) + 41"),
+        "MLE-runtime": go_solution("b := make([]byte, 1<<40)\nb[0] = 1\nreturn 42"),
+        "RE": go_solution('panic("boom")'),
+        "CE": go_solution("return 42 +"),
+    }),
 }
-OOM_MARKERS = {"python": "MemoryError", "cpp": "std::bad_alloc", "java": "java.lang.OutOfMemoryError"}
+OOM_MARKERS = {"python": "MemoryError", "cpp": "std::bad_alloc", "java": "java.lang.OutOfMemoryError",
+               "go": "runtime: out of memory"}
 
 
 class Verdicts(unittest.TestCase):
@@ -113,7 +142,7 @@ class TestVerdictMatrix(Verdicts):
                     stderr = (report["failed_testcase"] or {}).get("stderr") or ""
                     if case == "MLE-runtime":
                         self.assertIn(OOM_MARKERS[language], stderr)
-                    if case == "MLE-cgroup":
+                    if case == "MLE-cgroup" and language in OOM_MARKERS:
                         self.assertNotIn(OOM_MARKERS[language], stderr)
                     if case == "CE":
                         self.assertTrue(report["compile_error"])
@@ -177,6 +206,29 @@ class TestJava(Verdicts):
         uptime_ms = int(report["test_results"][0]["std_output"].split()[-1])
         self.assertGreaterEqual(uptime_ms, 1500)
         self.assertLessEqual(report["runtime_ms"], uptime_ms + JAIL_CPU_OVERHEAD_MS, report["runtime_ms"])
+
+
+class TestC(Verdicts):
+    def test_driver_including_the_solution_links_with_libm(self):
+        # Compiling solution.c on its own as well would define f and counter twice.
+        solution = "#include <math.h>\nint counter = 41;\nint f(void) { volatile double x = 2; return counter + (int)sqrt(x * 0.5); }\n"
+        self.verdict(executor.run_job(**job("c", solution, C_DRIVER)), "ACC")
+
+
+class TestGo(Verdicts):
+    def test_a_job_compiles_well_under_the_compile_time_limit(self):
+        # Prebuilt standard library: compile and link take about a second, not the
+        # ~10 s a cold `go build` spends rebuilding the standard library.
+        solution = ('package main\n\nimport (\n"sort"\n"strings"\n)\n\n'
+                    'func f() int {\ns := strings.Fields("3 1 2")\nsort.Strings(s)\nreturn len(s) * 14\n}\n')
+        started = time.monotonic()
+        self.verdict(executor.run_job(**job("go", solution, GO_DRIVER)), "ACC")
+        self.assertLess(time.monotonic() - started, 5)   # the compile limit is 30 s
+
+    def test_runtime_error_is_the_panics_exit_code(self):
+        report = self.verdict(executor.run_job(**job("go", MATRIX["go"][1]["RE"], GO_DRIVER)), "RE")
+        self.assertIn("exit code 2", report["runtime_error"])
+        self.assertIn("panic: boom", report["runtime_error"])
 
 
 class TestPythonVerdicts(Verdicts):

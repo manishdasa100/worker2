@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List
 
 from languages.base import BaseLanguage, SHARED_LIBS, Toolchain
 
@@ -30,9 +30,9 @@ class PythonLanguage(BaseLanguage):
         with open(os.path.join(code_dir, "main.py"), "w") as f:
             f.write(driver_code)
 
-    def compile_command(self) -> Optional[List[str]]:
+    def compile_commands(self) -> List[List[str]]:
         # Leaves the .pyc files in /code, where the run phase's import reuses them.
-        return ["/usr/bin/python3", "-m", "py_compile", "main.py", "solution.py"]
+        return [["/usr/bin/python3", "-m", "py_compile", "main.py", "solution.py"]]
 
     def run_command(self, memory_limit_mb: int) -> List[str]:
         # -u: unbuffered, so debug prints survive a TLE/MLE SIGKILL and reach the report.

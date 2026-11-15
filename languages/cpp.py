@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List
 
 from languages.base import BaseLanguage, LOADER, Toolchain
 
@@ -27,10 +27,10 @@ class CppLanguage(BaseLanguage):
         with open(os.path.join(code_dir, "main.cpp"), "w") as f:
             f.write(driver_code)
 
-    def compile_command(self) -> Optional[List[str]]:
+    def compile_commands(self) -> List[List[str]]:
         # Runs inside the compile jail with cwd=/code (relative paths resolve there).
         # Writes /code/main, which the run jail then executes read-only.
-        return ["/usr/bin/g++-13", "-std=gnu++20", "-O2", "-static", "-o", "main", "main.cpp"]
+        return [["/usr/bin/g++-13", "-std=gnu++20", "-O2", "-static", "-o", "main", "main.cpp"]]
 
     def run_command(self, memory_limit_mb: int) -> List[str]:
         return ["/code/main"]

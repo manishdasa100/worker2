@@ -35,7 +35,7 @@ judge.py       verdict pipeline: compile (sandboxed) -> run tests -> classify
 calibrate.py   CALIBRATE: measure reference + slow/hog gap verification
 sandbox.py     nsjail wrapper; run + compile profiles; CPU-ms TLE, cgroup metrics
 cgroups.py     per-jail cgroups on runsc's v1 cgroupfs
-languages/     declarative handlers (write_files / compile_command / run_command)
+languages/     declarative handlers (write_files / compile_commands / run_command)
 sandbox/       run.cfg + compile.cfg (jail profiles), run.kafel + compile.kafel (seccomp), the jails' passwd + group
 tools/         profile_syscalls.py: strace the toolchains to re-check the seccomp policies
 ```

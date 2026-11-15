@@ -85,6 +85,44 @@ PROGRAMS = {
         "    System.out.println(r[0] + \" \" + r[1] + \" \" + l.get(0) + \" \" + depth(5000) + \" \" + big[9]"
         " + \" \" + String.format(\"%.2f\", Math.sqrt(2))); } }\n",
     ),
+    "c": (
+        "#include <stdlib.h>\n"
+        "static int cmp(const void* a, const void* b) { return *(const int*)a - *(const int*)b; }\n"
+        "void two_sum(int* nums, int n, int target, int* out) {\n"
+        "  for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++)\n"
+        "    if (nums[i] + nums[j] == target) { out[0] = i; out[1] = j; return; } }\n",
+        "#include <math.h>\n#include <pthread.h>\n#include <stdio.h>\n#include <string.h>\n"
+        "#include \"solution.c\"\n"
+        "static int depth(int n) { return n == 0 ? 0 : 1 + depth(n - 1); }\n"
+        "static void* work(void* p) { for (int j = 0; j < 100000; j++) __atomic_add_fetch((long*)p, 1, 0); return 0; }\n"
+        "int main(void) { int n, t; if (scanf(\"%d %d\", &n, &t) != 2) return 1;\n"
+        "  int* v = malloc(n * sizeof *v); for (int i = 0; i < n; i++) scanf(\"%d\", &v[i]);\n"
+        "  int r[2] = {-1, -1}; two_sum(v, n, t, r); qsort(v, n, sizeof *v, cmp);\n"
+        "  long acc = 0; pthread_t th[2]; for (int i = 0; i < 2; i++) pthread_create(&th[i], 0, work, &acc);\n"
+        "  for (int i = 0; i < 2; i++) pthread_join(th[i], 0);\n"
+        "  size_t sz = 64u << 20; char* big = malloc(sz); memset(big, 7, sz);\n"
+        "  printf(\"%d %d %d %ld %d %.2f\\n\", r[0], r[1], depth(100000), acc, big[42], sqrt(2.0)); }\n",
+    ),
+    "go": (
+        "package main\n\nfunc twoSum(nums []int, target int) []int {\n"
+        "\tseen := map[int]int{}\n"
+        "\tfor i, x := range nums {\n"
+        "\t\tif j, ok := seen[target-x]; ok {\n\t\t\treturn []int{j, i}\n\t\t}\n"
+        "\t\tseen[x] = i\n\t}\n\treturn nil\n}\n",
+        "package main\n\nimport (\n\t\"bufio\"\n\t\"fmt\"\n\t\"math\"\n\t\"os\"\n\t\"sort\"\n"
+        "\t\"strings\"\n\t\"sync\"\n)\n\n"
+        "func depth(n int) int {\n\tif n == 0 {\n\t\treturn 0\n\t}\n\treturn 1 + depth(n-1)\n}\n\n"
+        "func main() {\n\tin := bufio.NewReader(os.Stdin)\n\tvar n, t int\n\tfmt.Fscan(in, &n, &t)\n"
+        "\tv := make([]int, n)\n\tfor i := range v {\n\t\tfmt.Fscan(in, &v[i])\n\t}\n"
+        "\tr := twoSum(v, t)\n\tsort.Ints(v)\n"
+        "\tvar wg sync.WaitGroup\n\tvar mu sync.Mutex\n\tacc := 0\n"
+        "\tfor i := 0; i < 2; i++ {\n\t\twg.Add(1)\n\t\tgo func() {\n\t\t\tdefer wg.Done()\n"
+        "\t\t\tfor j := 0; j < 100000; j++ {\n\t\t\t\tmu.Lock()\n\t\t\t\tacc++\n\t\t\t\tmu.Unlock()\n"
+        "\t\t\t}\n\t\t}()\n\t}\n\twg.Wait()\n"
+        "\tfunc() {\n\t\tdefer func() { recover() }()\n\t\tvar m map[string]int\n\t\tm[\"x\"] = 1\n\t}()\n"
+        "\tbig := make([]int64, 8_000_000)\n\tfor i := range big {\n\t\tbig[i] = 7\n\t}\n"
+        "\tfmt.Println(r, depth(100000), acc, big[42], strings.Repeat(\"a\", 3), math.Sqrt(2))\n}\n",
+    ),
 }
 
 # strace prints the userspace names; kafel uses the kernel's for these.
@@ -93,11 +131,12 @@ KAFEL_NAMES = {"stat": "newstat", "fstat": "newfstat", "lstat": "newlstat", "una
 CODE_DIR = "/code"
 
 
-def traced(name, argv, stdin):
-    """Run argv under strace -f in CODE_DIR; the set of syscalls it made."""
+def traced(name, argv, stdin, toolchain):
+    """Run argv under strace -f in CODE_DIR, with the toolchain's variables; the set of syscalls it made."""
+    env = {**os.environ, **dict(var.split("=", 1) for var in toolchain.env)}
     with tempfile.NamedTemporaryFile(suffix=".trace") as trace:
         result = subprocess.run(["strace", "-f", "-qq", "-e", "signal=none", "-o", trace.name, *argv],
-                                cwd=CODE_DIR, input=stdin, capture_output=True, text=True)
+                                cwd=CODE_DIR, input=stdin, capture_output=True, text=True, env=env)
         if result.returncode != 0:
             print(f"!! {name} exited {result.returncode}: {result.stderr.strip()[-500:]}", file=sys.stderr)
         # Lines look like "1234  openat(AT_FDCWD, ..." or "1234  <... read resumed>".
@@ -115,9 +154,10 @@ def profile():
         subprocess.run(f"rm -rf {CODE_DIR}/*", shell=True, check=True)
         user_code, driver_code = PROGRAMS[lang_name]
         lang.write_files(CODE_DIR, user_code, driver_code)
-        if compile_command := lang.compile_command():
-            sets[(lang_name, "compile")] = traced(f"{lang_name} compile", compile_command, "")
-        sets[(lang_name, "run")] = traced(f"{lang_name} run", lang.run_command(256), INPUT)
+        if commands := lang.compile_commands():
+            sets[(lang_name, "compile")] = set().union(*(
+                traced(f"{lang_name} compile", c, "", lang.compile_toolchain) for c in commands))
+        sets[(lang_name, "run")] = traced(f"{lang_name} run", lang.run_command(256), INPUT, lang.run_toolchain)
 
     print("### Per-language, per-phase syscall sets")
     for (lang_name, phase), names in sets.items():

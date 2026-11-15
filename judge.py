@@ -41,6 +41,10 @@ WARMUP_PROGRAMS = {
             '#include <iostream>\n#include "solution.cpp"\nint main(){ std::cout << f() << std::endl; }\n'),
     "java": ("public class Solution { static int f() { return 42; } }\n",
              "public class Main { public static void main(String[] a) { System.out.println(Solution.f()); } }\n"),
+    "c": ("int f(void) { return 42; }\n",
+          '#include <stdio.h>\n#include "solution.c"\nint main(void) { printf("%d\\n", f()); return 0; }\n'),
+    "go": ("package main\n\nfunc f() int { return 42 }\n",
+           'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println(f()) }\n'),
 }
 
 
@@ -86,36 +90,36 @@ class Judge:
 
     async def _compile(self, lang, code_dir: str) -> CompileOutcome:
         """
-        Compile inside the jail (no host FS, no network, cgroup-bounded). Maps the
-        sandbox result to a compile verdict:
-          None command      -> interpreted, trivially ok
+        Compile inside the jail (no host FS, no network, cgroup-bounded), one jail
+        per compile command, sharing one compile CPU limit. Maps the first failing
+        command's sandbox result to a compile verdict:
+          no commands       -> nothing to compile, trivially ok
           time_limit_hit    -> compile time limit (likely a compile bomb)
           oom_killed        -> compile ran out of memory
-          exit != 0         -> compiler diagnostics (stderr)
+          exit != 0         -> compiler diagnostics (stderr, else stdout: Go's compiler prints there)
         """
-        command = lang.compile_command()
-        if command is None:
-            return CompileOutcome(ok=True)
-
         started = time.monotonic()
-        sr = await self.sandbox.compile(
-            command=command, code_dir=code_dir, toolchain=lang.compile_toolchain,
-            time_limit_ms=self.config.execution.compile_timeout * 1000,
-            memory_limit=self.config.execution.compile_memory_limit,
-        )
-        compile_ms = int((time.monotonic() - started) * 1000)
+        compile_cpu_left_ms = self.config.execution.compile_timeout * 1000
+        for command in lang.compile_commands():
+            sr = await self.sandbox.compile(
+                command=command, code_dir=code_dir, toolchain=lang.compile_toolchain,
+                time_limit_ms=compile_cpu_left_ms,
+                memory_limit=self.config.execution.compile_memory_limit,
+            )
+            compile_ms = int((time.monotonic() - started) * 1000)
 
-        if sr.setup_failed:
-            raise RuntimeError(f"Jail failed to launch the compiler (exit={sr.exit_code}): "
-                               f"{sr.nsjail_log[-500:]}")
-        if sr.time_limit_hit:
-            return CompileOutcome(False, "Compilation timed out", compile_ms)
-        if sr.oom_killed:
-            return CompileOutcome(False, "Compilation ran out of memory", compile_ms)
-        if sr.exit_code != 0:
-            msg = (sr.stderr or sr.stdout or "Compilation error").strip()
-            return CompileOutcome(False, msg[: self.config.execution.max_output_bytes], compile_ms)
-        return CompileOutcome(ok=True, compile_ms=compile_ms)
+            if sr.setup_failed:
+                raise RuntimeError(f"Jail failed to launch the compiler (exit={sr.exit_code}): "
+                                   f"{sr.nsjail_log[-500:]}")
+            if sr.time_limit_hit:
+                return CompileOutcome(False, "Compilation timed out", compile_ms)
+            if sr.oom_killed:
+                return CompileOutcome(False, "Compilation ran out of memory", compile_ms)
+            if sr.exit_code != 0:
+                msg = (sr.stderr or sr.stdout or "Compilation error").strip()
+                return CompileOutcome(False, msg[: self.config.execution.max_output_bytes], compile_ms)
+            compile_cpu_left_ms = max(1, compile_cpu_left_ms - sr.cpu_ms)
+        return CompileOutcome(ok=True, compile_ms=int((time.monotonic() - started) * 1000))
 
     # ---- main entry ---------------------------------------------------------
 

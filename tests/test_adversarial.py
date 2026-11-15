@@ -10,10 +10,11 @@ nothing one job writes survives into the next.
 
 Kernel surface (seccomp). The probe below tries each syscall and reports how it was
 refused, so a refusal the program can handle shows up as an ordinary errno and a
-policy kill shows up as Runtime Error "forbidden syscall".
+policy kill shows up as Runtime Error "forbidden syscall". The same checks run from
+Python (ctypes) and from a static C binary making raw syscalls.
 
-No language runs submitted code at compile time (py_compile, javac and g++ execute
-nothing from the source), so the compile-phase cases run the probe in the executor's
+No language runs submitted code at compile time (py_compile, javac, gcc, g++ and Go's
+compile and link execute nothing they are given), so the compile-phase cases run the probe in the executor's
 own compile jail, inside the same container. Ticket 13's self-test replaces this with
 probes reported through `ready`.
 """
@@ -26,7 +27,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.executor_harness import ExecutorContainer
-from tests.test_executor import CPP_DRIVER, Verdicts, job, python_job
+from tests.test_executor import C_DRIVER, CPP_DRIVER, Verdicts, job, python_job
 
 executor = None
 
@@ -135,6 +136,108 @@ FORBIDDEN = [
 ]
 
 
+# The same checks in C, through raw syscall(2), plus filesystem escapes. A driver
+# that prints "check=outcome ..." (outcome "ok", the errno's name or a listing).
+C_PROBE = r"""#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static char buf[64];
+static const char* outcome(long r) {
+  static char other[16];
+  if (r >= 0) return "ok";
+  switch (errno) {
+    case EAGAIN: return "EAGAIN"; case ENOSYS: return "ENOSYS"; case EACCES: return "EACCES";
+    case ENOTTY: return "ENOTTY"; case EPERM: return "EPERM"; case ENOENT: return "ENOENT";
+    case EROFS: return "EROFS"; case EINVAL: return "EINVAL";
+  }
+  snprintf(other, sizeof other, "E%d", errno);
+  return other;
+}
+static long spawned(long r) {   /* fork-like: the child, if any, leaves at once */
+  if (r == 0) _exit(0);
+  if (r > 0) waitpid(r, 0, 0);
+  return r;
+}
+static void* noop(void* a) { return a; }
+static long thread(void) {
+  pthread_t t;
+  int e = pthread_create(&t, 0, noop, 0);
+  if (e) { errno = e; return -1; }
+  return pthread_join(t, 0);
+}
+static void ls(const char* name, const char* path) {
+  char out[256] = "";
+  DIR* d = opendir(path);
+  struct dirent* e;
+  if (!d) { printf("%s=%s ", name, outcome(-1)); return; }
+  /* readdir order isn't sorted; the test compares sets of entries */
+  while ((e = readdir(d))) if (e->d_name[0] != '.') { strcat(out, out[0] ? "," : ""); strcat(out, e->d_name); }
+  closedir(d);
+  printf("%s=%s ", name, out[0] ? out : "-");
+}
+#define CHECK(name, expr) printf("%s=%s ", name, outcome(expr))
+#define SIGCHLD_ 17L
+#define CLONE_NEWUSER_ 0x10000000L
+#define THREAD_FLAGS (0x100L | 0x800L | 0x10000L)
+int main(void) {
+  CHECK("thread", thread());
+  CHECK("os_fork", spawned(fork()));
+  CHECK("fork", spawned(syscall(57)));
+  CHECK("vfork", spawned(syscall(58)));   /* only safe while refused */
+  CHECK("clone", spawned(syscall(56, SIGCHLD_, 0L, 0L, 0L, 0L)));
+  CHECK("clone_newuser", spawned(syscall(56, SIGCHLD_ | CLONE_NEWUSER_, 0L, 0L, 0L, 0L)));
+  CHECK("clone_thread_newuser", syscall(56, THREAD_FLAGS | CLONE_NEWUSER_, 0L, 0L, 0L, 0L));
+  CHECK("clone3", syscall(435, 0L, 0L));
+  CHECK("io_uring_setup", syscall(425, 1L, 0L));
+  CHECK("socket_inet", syscall(41, 2L, 1L, 0L));
+  CHECK("socket_inet6", syscall(41, 10L, 1L, 0L));
+  CHECK("socket_unix", syscall(41, 1L, 1L, 0L));
+  CHECK("socket_netlink", syscall(41, 16L, 3L, 0L));
+  CHECK("socket_packet", syscall(41, 17L, 3L, 0L));
+  CHECK("socketpair_unix", syscall(53, 1L, 1L, 0L, buf));
+  CHECK("socketpair_inet", syscall(53, 2L, 1L, 0L, buf));
+  CHECK("ioctl_fionread", syscall(16, 0L, 0x541BL, buf));
+  CHECK("ioctl_fionread_high_bits", syscall(16, 0L, 0x10000541BL, buf));
+  CHECK("ioctl_tiocsti", syscall(16, 0L, 0x5412L, buf));
+  CHECK("prlimit_self", syscall(302, 0L, 7L, 0L, buf));
+  CHECK("prlimit_other", syscall(302, 1L, 7L, 0L, buf));
+  CHECK("x32_getpid", syscall(0x40000000L | 39));
+  CHECK("unlisted_mlock", syscall(149, buf, 64L));
+  CHECK("setuid_root", syscall(105, 0L));
+  CHECK("proc_environ", syscall(257, AT_FDCWD, "/proc/self/environ", (long)O_RDONLY));
+  CHECK("proc_1_root", syscall(257, AT_FDCWD, "/proc/1/root/etc/hostname", (long)O_RDONLY));
+  CHECK("shadow", syscall(257, AT_FDCWD, "/etc/shadow", (long)O_RDONLY));
+  CHECK("executor_source", syscall(257, AT_FDCWD, "/code/../opt/executor/config.py", (long)O_RDONLY));
+  CHECK("write_root", syscall(257, AT_FDCWD, "/pwned", (long)(O_WRONLY | O_CREAT), 0644L));
+  CHECK("write_code", syscall(257, AT_FDCWD, "/code/pwned", (long)(O_WRONLY | O_CREAT), 0644L));
+  CHECK("write_dev", syscall(257, AT_FDCWD, "/dev/pwned", (long)(O_WRONLY | O_CREAT), 0644L));
+  ls("root", "/");
+  ls("dev", "/dev");
+  ls("proc", "/proc");
+  ls("sys", "/sys");
+  printf("\n");
+  return 0;
+}
+"""
+C_RUN_PHASE = {**RUN_PHASE, "setuid_root": "ENOSYS", "proc_environ": "ENOENT", "proc_1_root": "ENOENT",
+               "shadow": "ENOENT", "executor_source": "ENOENT", "write_root": "EROFS",
+               "write_code": "EROFS", "write_dev": "EROFS", "root": "code,dev,etc,stats,tmp",
+               "dev": "null,urandom,zero", "proc": "ENOENT", "sys": "ENOENT"}
+
+
+def c_forbidden_call(nr, args):
+    return ("#include <unistd.h>\n#include <sys/syscall.h>\n"
+            f"int f(void) {{ syscall({nr}" + "".join(f", {a}L" for a in args) + "); return 42; }\n")
+
+
 def forbidden_call(nr, args):
     return (f"import ctypes\ndef f():\n    ctypes.CDLL(None).syscall({nr}, "
             + "".join(f"ctypes.c_ulong({a}), " for a in args) + ")\n    return 42\n")
@@ -181,6 +284,22 @@ class TestRunPhaseSyscalls(Verdicts):
         for name, nr, args in FORBIDDEN:
             with self.subTest(syscall=name):
                 report = self.verdict(executor.run_job(**python_job(forbidden_call(nr, args))), "RE")
+                self.assertIn("forbidden syscall", report["runtime_error"])
+
+
+class TestRunPhaseInC(Verdicts):
+    """Raw syscalls from a static C binary: the likeliest escape attempts."""
+
+    def test_raw_syscalls_are_refused_and_the_host_is_out_of_reach(self):
+        report = self.verdict(executor.run_job(**job(
+            "c", "", C_PROBE, task="RUN_CODE", test_cases=[{"input": "", "expectedOutput": ""}])), "ACC")
+        seen = outcomes(report["test_results"][0]["actual_output"])
+        self.assertEqual({k: ",".join(sorted(v.split(","))) for k, v in seen.items()}, C_RUN_PHASE)
+
+    def test_dangerous_syscalls_are_forbidden(self):
+        for name, nr, args in FORBIDDEN:
+            with self.subTest(syscall=name):
+                report = self.verdict(executor.run_job(**job("c", c_forbidden_call(nr, args), C_DRIVER)), "RE")
                 self.assertIn("forbidden syscall", report["runtime_error"])
 
 
@@ -343,11 +462,12 @@ class TestCompilePhaseFilesystem(Verdicts):
                                 "write_code": "ok", "tmp_4gb_file": "EFBIG"})
 
     def test_host_files_cannot_be_included_at_compile_time(self):
-        for path in ("/etc/shadow", "/opt/executor/config.py", "/proc/self/environ"):
-            with self.subTest(path=path):
-                report = self.verdict(executor.run_job(**job(
-                    "cpp", f'#include "{path}"\nint f() {{ return 42; }}\n', CPP_DRIVER)), "CE")
-                self.assertIn("No such file or directory", report["compile_error"])
+        for language, driver in (("cpp", CPP_DRIVER), ("c", C_DRIVER)):
+            for path in ("/etc/shadow", "/opt/executor/config.py", "/proc/self/environ"):
+                with self.subTest(language=language, path=path):
+                    report = self.verdict(executor.run_job(**job(
+                        language, f'#include "{path}"\nint f() {{ return 42; }}\n', driver)), "CE")
+                    self.assertIn("No such file or directory", report["compile_error"])
 
     def test_a_compile_that_overflows_its_workspace_is_a_compile_error(self):
         # A 100 MB initialised array: the linker's output can't fit the workspace.
