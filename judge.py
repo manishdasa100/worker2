@@ -45,6 +45,10 @@ WARMUP_PROGRAMS = {
           '#include <stdio.h>\n#include "solution.c"\nint main(void) { printf("%d\\n", f()); return 0; }\n'),
     "go": ("package main\n\nfunc f() int { return 42 }\n",
            'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println(f()) }\n'),
+    "javascript": ("function f() { return 42; }\nmodule.exports = { f };\n",
+                   "const { f } = require('./solution');\nconsole.log(f());\n"),
+    "rust": ("pub fn f() -> i32 { 42 }\n",
+             'mod solution;\nfn main() { println!("{}", solution::f()); }\n'),
 }
 
 
@@ -95,7 +99,7 @@ class Judge:
         command's sandbox result to a compile verdict:
           no commands       -> nothing to compile, trivially ok
           time_limit_hit    -> compile time limit (likely a compile bomb)
-          oom_killed        -> compile ran out of memory
+          oom_killed        -> compile exceeded its memory limit
           exit != 0         -> compiler diagnostics (stderr, else stdout: Go's compiler prints there)
         """
         started = time.monotonic()
@@ -114,7 +118,7 @@ class Judge:
             if sr.time_limit_hit:
                 return CompileOutcome(False, "Compilation timed out", compile_ms)
             if sr.oom_killed:
-                return CompileOutcome(False, "Compilation ran out of memory", compile_ms)
+                return CompileOutcome(False, "Compilation exceeded its memory limit", compile_ms)
             if sr.exit_code != 0:
                 msg = (sr.stderr or sr.stdout or "Compilation error").strip()
                 return CompileOutcome(False, msg[: self.config.execution.max_output_bytes], compile_ms)

@@ -53,6 +53,8 @@ JAVA_DRIVER = "public class Main { public static void main(String[] a){ System.o
 
 C_DRIVER = '#include <stdio.h>\n#include "solution.c"\nint main(void) { printf("%d\\n", f()); return 0; }\n'
 GO_DRIVER = 'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println(f()) }\n'
+JS_DRIVER = "const { f } = require('./solution');\nconsole.log(f());\n"
+RUST_DRIVER = 'mod solution;\n\nfn main() {\n    println!("{}", solution::f());\n}\n'
 
 
 def java_solution(body):
@@ -61,6 +63,14 @@ def java_solution(body):
 
 def go_solution(body):
     return "package main\n\nfunc f() int {\n" + body + "\n}\n"
+
+
+def js_solution(body):
+    return "function f() {\n" + body + "\n}\nmodule.exports = { f };\n"
+
+
+def rust_solution(body):
+    return "pub fn f() -> i32 {\n" + body + "\n}\n"
 
 
 # Per language: its driver and one solution per verdict. "MLE-cgroup" is killed by the
@@ -118,9 +128,30 @@ MATRIX = {
         "RE": go_solution('panic("boom")'),
         "CE": go_solution("return 42 +"),
     }),
+    # Node's heap is as large as the limit, so the memory watch kills a heap blow-up
+    # before V8 reports it: no MLE-runtime.
+    "javascript": (JS_DRIVER, {
+        "ACC": js_solution("return 42;"),
+        "WA": js_solution("return 41;"),
+        "TLE": js_solution("for (;;) {}"),
+        # Buffers live outside the JavaScript heap, so this is the cgroup's limit, not V8's.
+        "MLE-cgroup": js_solution("const a = []; for (let i = 0; i < 200; i++) a.push(Buffer.alloc(1 << 20, 1));"
+                                  " return a.length > 0 ? 42 : 0;"),
+        "RE": js_solution("throw new Error('boom');"),
+        "CE": js_solution("return 42 +;"),
+    }),
+    "rust": (RUST_DRIVER, {
+        "ACC": rust_solution("42"),
+        "WA": rust_solution("41"),
+        "TLE": rust_solution("loop {\n    std::hint::black_box(0);\n}"),
+        "MLE-cgroup": rust_solution("let v = vec![1u8; 200 << 20];\nstd::hint::black_box(&v);\nv[100 << 20] as i32 + 41"),
+        "MLE-runtime": rust_solution("let v: Vec<u8> = Vec::with_capacity(1 << 40);\nstd::hint::black_box(&v);\n42"),
+        "RE": rust_solution('panic!("boom")'),
+        "CE": rust_solution("42 +"),
+    }),
 }
 OOM_MARKERS = {"python": "MemoryError", "cpp": "std::bad_alloc", "java": "java.lang.OutOfMemoryError",
-               "go": "runtime: out of memory"}
+               "go": "runtime: out of memory", "rust": "memory allocation of"}
 
 
 class Verdicts(unittest.TestCase):
@@ -229,6 +260,58 @@ class TestGo(Verdicts):
         report = self.verdict(executor.run_job(**job("go", MATRIX["go"][1]["RE"], GO_DRIVER)), "RE")
         self.assertIn("exit code 2", report["runtime_error"])
         self.assertIn("panic: boom", report["runtime_error"])
+
+
+class TestJavaScript(Verdicts):
+    def test_syntax_error_is_a_compile_error_with_nodes_message(self):
+        report = self.verdict(executor.run_job(**job("javascript", MATRIX["javascript"][1]["CE"], JS_DRIVER)), "CE")
+        self.assertIn("solution.js", report["compile_error"])
+        self.assertIn("SyntaxError", report["compile_error"])
+
+    def test_syntax_error_in_the_driver_is_a_compile_error_too(self):
+        report = self.verdict(executor.run_job(**job("javascript", MATRIX["javascript"][1]["ACC"],
+                                                     "const { f } = require('./solution');\nconsole.log(f(;\n")), "CE")
+        self.assertIn("main.js", report["compile_error"])
+
+    def test_heap_blow_up_is_memory_limit_exceeded(self):
+        self.verdict(executor.run_job(**job("javascript", js_solution("const a = []; for (;;) a.push({ i: a.length });"),
+                                            JS_DRIVER, time_limit=5000, memory_limit=128)), "MLE")
+
+    def test_calibrations_memory_limit_starts_node(self):
+        # 1024 MB stack rlimit: with V8's default four worker threads Node hangs at startup.
+        report = self.verdict(executor.run_job(**job("javascript", MATRIX["javascript"][1]["ACC"], JS_DRIVER,
+                                                     task="CALIBRATE")), "ACC")
+        self.assertTrue(report["calibration"])
+
+    def test_64_mb_of_objects_fits_a_128_mb_budget(self):
+        solution = js_solution("const a = []; for (let i = 0; i < 64; i++) a.push(new Array(1 << 17).fill(i));"
+                               " return a.length === 64 ? 42 : 0;")
+        self.verdict(executor.run_job(**job("javascript", solution, JS_DRIVER, time_limit=5000,
+                                            memory_limit=128)), "ACC")
+
+
+class TestRust(Verdicts):
+    def test_a_compile_past_768_mb_is_a_compile_error(self):
+        # Constant evaluation builds the 1 GiB array in rustc's own memory.
+        solution = "static A: [u8; 1 << 30] = [1; 1 << 30];\npub fn f() -> i32 {\n    A[7] as i32 + 41\n}\n"
+        report = self.verdict(executor.run_job(**job("rust", solution, RUST_DRIVER)), "CE")
+        self.assertIn("exceeded its memory limit", report["compile_error"])
+
+    def test_runtime_error_is_the_panics_exit_code(self):
+        report = self.verdict(executor.run_job(**job("rust", MATRIX["rust"][1]["RE"], RUST_DRIVER)), "RE")
+        self.assertIn("exit code 101", report["runtime_error"])
+        self.assertIn("boom", report["runtime_error"])
+
+    def test_recursive_dfs_of_depth_100000_fits_a_128_mb_budget(self):
+        solution = ("fn depth(adj: &[Vec<usize>], u: usize, p: usize) -> usize {\n"
+                    "    let frame = std::hint::black_box([0u8; 256]);\n"
+                    "    let mut best = 0;\n"
+                    "    for &v in &adj[u] { if v != p { best = best.max(depth(adj, v, u)); } }\n"
+                    "    best + 1 + frame[0] as usize\n}\n"
+                    "pub fn f() -> i32 {\n    let n = 100_000;\n    let mut adj = vec![Vec::new(); n];\n"
+                    "    for i in 1..n { adj[i - 1].push(i); adj[i].push(i - 1); }\n"
+                    "    if depth(&adj, 0, usize::MAX) == n { 42 } else { 0 }\n}\n")
+        self.verdict(executor.run_job(**job("rust", solution, RUST_DRIVER, memory_limit=128)), "ACC")
 
 
 class TestPythonVerdicts(Verdicts):

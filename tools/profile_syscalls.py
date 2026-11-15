@@ -123,6 +123,42 @@ PROGRAMS = {
         "\tbig := make([]int64, 8_000_000)\n\tfor i := range big {\n\t\tbig[i] = 7\n\t}\n"
         "\tfmt.Println(r, depth(100000), acc, big[42], strings.Repeat(\"a\", 3), math.Sqrt(2))\n}\n",
     ),
+    "javascript": (
+        "function twoSum(nums, target) {\n  const seen = new Map();\n"
+        "  for (let i = 0; i < nums.length; i++) {\n"
+        "    if (seen.has(target - nums[i])) return [seen.get(target - nums[i]), i];\n"
+        "    seen.set(nums[i], i);\n  }\n  return [];\n}\nmodule.exports = { twoSum };\n",
+        "const { twoSum } = require('./solution');\n"
+        "const data = require('fs').readFileSync(0, 'utf8').split(/\\s+/).filter(Boolean).map(Number);\n"
+        "const [n, t] = data;\nconst r = twoSum(data.slice(2, 2 + n), t);\n"
+        "const depth = (k) => (k === 0 ? 0 : 1 + depth(k - 1));\n"
+        "try { null.x; } catch (e) {}\n"
+        "const big = new Array(8_000_000).fill(7);\n"
+        "const sorted = Array.from({ length: 100000 }, (_, i) => i).sort((a, b) => b - a);\n"
+        "Promise.resolve(JSON.stringify({ a: 1 })).then((j) => {\n"
+        "  setTimeout(() => console.log(r.join(' '), depth(10000), big[42], sorted[0], j, Math.sqrt(2).toFixed(2)), 1);\n"
+        "});\n",
+    ),
+    "rust": (
+        "use std::collections::HashMap;\n\n"
+        "pub fn two_sum(nums: &[i64], target: i64) -> Vec<usize> {\n"
+        "    let mut seen = HashMap::new();\n"
+        "    for (i, &x) in nums.iter().enumerate() {\n"
+        "        if let Some(&j) = seen.get(&(target - x)) { return vec![j, i]; }\n"
+        "        seen.insert(x, i);\n    }\n    vec![]\n}\n",
+        "use std::io::Read;\nuse std::sync::{Arc, Mutex};\n\nmod solution;\n\n"
+        "fn depth(n: u64) -> u64 { if n == 0 { 0 } else { 1 + depth(std::hint::black_box(n - 1)) } }\n\n"
+        "fn main() {\n    let mut s = String::new();\n    std::io::stdin().read_to_string(&mut s).unwrap();\n"
+        "    let v: Vec<i64> = s.split_whitespace().map(|x| x.parse().unwrap()).collect();\n"
+        "    let (n, t) = (v[0] as usize, v[1]);\n    let r = solution::two_sum(&v[2..2 + n], t);\n"
+        "    let acc = Arc::new(Mutex::new(0u64));\n"
+        "    let th: Vec<_> = (0..2).map(|_| { let a = Arc::clone(&acc);\n"
+        "        std::thread::spawn(move || for _ in 0..100000 { *a.lock().unwrap() += 1; }) }).collect();\n"
+        "    for h in th { h.join().unwrap(); }\n"
+        "    let caught = std::panic::catch_unwind(|| { let e: Vec<i32> = vec![]; e[std::hint::black_box(1)] }).is_err();\n"
+        "    let big = vec![7i64; 8_000_000];\n"
+        "    println!(\"{:?} {} {} {} {} {:.2}\", r, depth(100000), *acc.lock().unwrap(), caught, big[42], 2f64.sqrt());\n}\n",
+    ),
 }
 
 # strace prints the userspace names; kafel uses the kernel's for these.

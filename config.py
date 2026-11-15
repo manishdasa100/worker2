@@ -76,7 +76,7 @@ class ExecutionConfig:
     # visible and no network, so a malicious source can't read host files at
     # compile time or exhaust host RAM. These bound that jail.
     compile_timeout: int = 30             # CPU-seconds for the compile step
-    compile_memory_limit: int = 512       # MB for the compile jail (g++/javac are hungry)
+    compile_memory_limit: int = 768       # MB for the compile jail (rustc/javac are hungry)
 
     # --- CALIBRATE task ---
     calibration_runs: int = 5

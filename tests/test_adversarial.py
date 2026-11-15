@@ -259,7 +259,7 @@ def compile_phase(code):
         "async def main():\n"
         "    with workspace() as code_dir:\n"
         "        return await sandbox.compile(['/usr/bin/python3', '-c', sys.argv[1]], code_dir,"
-        " get_language('python').compile_toolchain, time_limit_ms=10000, memory_limit=512)\n"
+        " get_language('python').compile_toolchain, time_limit_ms=10000, memory_limit=load_config(None).execution.compile_memory_limit)\n"
         "r = asyncio.run(main())\n"
         "print(json.dumps({'stdout': r.stdout, 'stderr': r.stderr, 'signal': r.signal,"
         " 'exit_code': r.exit_code, 'setup_failed': r.setup_failed}))\n")

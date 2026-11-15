@@ -31,6 +31,39 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         go list -export -f '{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}' std \
         > /opt/go-std/importcfg
 
+FROM ubuntu:24.04 AS node
+# Node 22 LTS, the official release, checked against nodejs.org's SHASUMS256.txt.
+# Only the node binary is kept: no npm, no bundled node_modules.
+ARG NODE_VERSION=22.23.5
+ARG NODE_SHA256=cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+ && curl -fsSL -o /node.txz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+ && echo "${NODE_SHA256}  /node.txz" | sha256sum -c - \
+ && mkdir -p /opt/node/bin \
+ && tar -xJf /node.txz -C /opt/node/bin --strip-components=2 "node-v${NODE_VERSION}-linux-x64/bin/node"
+
+FROM ubuntu:24.04 AS rust
+# Rust stable, exactly pinned: just rustc and the x86_64 gnu standard library, from
+# static.rust-lang.org's tarballs, checked against their published sha256.
+ARG RUST_VERSION=1.100.0
+ARG RUSTC_SHA256=f1d0b1dec81dab6f523cd098507763487b0d4bd7fd2c87582f154128719be03b
+ARG RUST_STD_SHA256=4591b6486594ded52ecd6135db95bf9355bbd3ca7a380888b141528bbcf9a5d4
+ARG RUST_DIST=https://static.rust-lang.org/dist
+ARG RUST_TARGET=x86_64-unknown-linux-gnu
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+ && cd /tmp \
+ && curl -fsSL -o rustc.txz "${RUST_DIST}/rustc-${RUST_VERSION}-${RUST_TARGET}.tar.xz" \
+ && echo "${RUSTC_SHA256}  rustc.txz" | sha256sum -c - \
+ && curl -fsSL -o rust-std.txz "${RUST_DIST}/rust-std-${RUST_VERSION}-${RUST_TARGET}.tar.xz" \
+ && echo "${RUST_STD_SHA256}  rust-std.txz" | sha256sum -c - \
+ && tar -xJf rustc.txz && tar -xJf rust-std.txz \
+ && "rustc-${RUST_VERSION}-${RUST_TARGET}/install.sh" --prefix=/opt/rust --disable-ldconfig \
+ && "rust-std-${RUST_VERSION}-${RUST_TARGET}/install.sh" --prefix=/opt/rust --disable-ldconfig
+# Keep rustc, its shared libraries and the standard library. Jobs link with the
+# system gcc, so rust-lld (rustlib/*/bin) goes too.
+RUN cd /opt/rust && rm -rf share etc libexec bin/rust-gdb bin/rust-gdbgui bin/rust-lldb bin/rustdoc \
+        lib/rustlib/etc lib/rustlib/x86_64-unknown-linux-gnu/bin lib/rustlib/[!x]*
+
 FROM ubuntu:24.04
 # Toolchains, pinned by major version through the 24.04 package names: Python 3.12
 # (python3), GCC 13 for C and C++ (g++-13 brings gcc-13 and the static libc and
@@ -43,6 +76,8 @@ COPY --from=nsjail /nsjail/nsjail /usr/local/bin/nsjail
 COPY --from=go /usr/local/go/pkg/tool/linux_amd64/compile /usr/local/go/pkg/tool/linux_amd64/link \
      /usr/local/go/pkg/tool/linux_amd64/
 COPY --from=go /opt/go-std /opt/go-std
+COPY --from=node /opt/node /opt/node
+COPY --from=rust /opt/rust /opt/rust
 
 WORKDIR /opt/executor
 COPY *.py ./
