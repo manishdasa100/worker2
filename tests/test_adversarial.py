@@ -14,9 +14,10 @@ policy kill shows up as Runtime Error "forbidden syscall". The same checks run f
 Python (ctypes) and from a static C binary making raw syscalls.
 
 No language runs submitted code at compile time (py_compile, javac, gcc, g++ and Go's
-compile and link execute nothing they are given), so the compile-phase cases run the probe in the executor's
-own compile jail, inside the same container. Ticket 13's self-test replaces this with
-probes reported through `ready`.
+compile and link execute nothing they are given). So the compile phase's kernel surface
+is checked by the executor's containment self-test and read back through `ready`, and
+its filesystem by running the probe in the executor's own compile jail, inside the
+same container.
 """
 import json
 import os
@@ -120,12 +121,9 @@ RUN_PHASE = {
     "ioctl_fionread": "ok", "ioctl_fionread_high_bits": "ENOTTY", "ioctl_tiocsti": "ENOTTY",
     "prlimit_self": "ok", "prlimit_other": "EPERM", "x32_getpid": "ENOSYS", "unlisted_mlock": "ENOSYS",
 }
-# Compilers spawn subprocesses and the rustc jobserver needs an AF_UNIX pair; nothing else changes.
-# The probe can't test vfork where it is allowed (see PROBE).
-COMPILE_PHASE = {**RUN_PHASE, "os_fork": "ok", "fork": "ok", "clone": "ok", "socketpair_unix": "ok"}
-del COMPILE_PHASE["vfork"]
 
-# Killed outright in both phases: (name, syscall number, args).
+# Killed outright in both phases: (name, syscall number, args). The run phase is
+# tried here; the compile phase by the self-test, read back through `ready`.
 FORBIDDEN = [
     ("ptrace", 101, (0,)),               # PTRACE_TRACEME
     ("unshare", 272, (0x10000000,)),     # CLONE_NEWUSER
@@ -304,17 +302,15 @@ class TestRunPhaseInC(Verdicts):
 
 
 class TestCompilePhaseSyscalls(unittest.TestCase):
-    def test_refused_syscalls_fail_with_an_ordinary_error(self):
-        result = compile_phase(PROBE + "print(f(skip={'vfork'}))\n")
-        self.assertEqual(result["exit_code"], 0, result)
-        self.assertEqual(outcomes(result["stdout"].strip().splitlines()[-1]), COMPILE_PHASE)
-
-    def test_dangerous_syscalls_are_forbidden(self):
-        for name, nr, args in FORBIDDEN:
-            with self.subTest(syscall=name):
-                result = compile_phase(forbidden_call(nr, args) + "f()\n")
-                self.assertFalse(result["setup_failed"], result)
-                self.assertEqual(result["signal"], 31, result)   # SIGSYS
+    def test_the_self_test_finds_the_compile_phase_contained(self):
+        checks = {c["name"]: c for c in executor.ready()["checks"]}
+        kills = [f"compile_seccomp_kills_{name}" for name, _, _ in FORBIDDEN]
+        for name in (*kills, "compile_no_sockets",
+                     "compile_x32_abi_blocked", "compile_io_uring_blocked", "compile_ioctl_high_bits_blocked",
+                     "compile_no_capabilities", "compile_default_action_denies_unlisted",
+                     "compile_fork_bounded"):
+            with self.subTest(check=name):
+                self.assertTrue(checks[name]["ok"], checks[name])
 
 
 # f() returns "check=outcome ...": "ok", the errno's (or exception's) name, or a listing.

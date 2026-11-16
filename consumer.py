@@ -10,8 +10,9 @@ draining, shutdown.
 
 At-least-once: a job is acked only after its result is published. A publish
 failure, or an executor that can't be reached or answers nonsense, leaves the
-job unacked, and XAUTOCLAIM redelivers it. A slot whose executor failed sits
-out SLOT_RETRY_S, so a dead executor can't drain the queue into unacked jobs.
+job unacked, and XAUTOCLAIM redelivers it. So does one refused by an executor
+whose self-test failed. A slot whose executor failed or refused sits out
+SLOT_RETRY_S, so a dead executor can't drain the queue into unacked jobs.
 """
 import asyncio
 import dataclasses
@@ -49,7 +50,10 @@ async def run_job(socket_path: str, job: ExecutionRequest) -> dict:
         writer.close()
     if not line:
         raise ConnectionError(f"executor at {socket_path} closed without answering")
-    return json.loads(line)
+    response = json.loads(line)
+    if response.get("status") == "NOT_READY":    # nothing ran: an executor failure, not a result
+        raise ConnectionError(f"executor at {socket_path} refused the job: {response.get('error')}")
+    return response
 
 
 class Consumer:

@@ -3,6 +3,10 @@ Seam A: a real executor container under runsc, reached only through its socket.
 
     with ExecutorContainer() as executor:
         executor.run_job(job_id=..., language=..., ...)   # -> response dict
+        executor.ready()                                  # -> the latest self-test report
+
+Entering waits for the startup self-test and fails unless it passed; pass
+require_ready=False to inspect a failing one. docker_args go to `docker run`.
 
 Builds the image from this checkout first (cached, so quick when unchanged).
 EXECUTOR_RUNTIME picks the Docker runtime: it must be runsc with
@@ -20,11 +24,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGE = os.environ.get("EXECUTOR_IMAGE", "codinglemons-executor")
 RUNTIME = os.environ.get("EXECUTOR_RUNTIME", "runsc-executor")
 STARTUP_TIMEOUT_S = 60
+SELF_TEST_TIMEOUT_S = 600
 JOB_TIMEOUT_S = 300
 
 
 class ExecutorContainer:
-    def __init__(self):
+    def __init__(self, docker_args=(), require_ready=True):
+        self.docker_args = list(docker_args)
+        self.require_ready = require_ready
         self.dir = tempfile.mkdtemp(prefix="executor-")   # short: AF_UNIX paths max out at 108 bytes
         os.chmod(self.dir, 0o777)                         # the container's root binds the socket here
         self.socket = os.path.join(self.dir, "executor.sock")
@@ -40,7 +47,7 @@ class ExecutorContainer:
             # SYS_ADMIN (gVisor's, not the host's) lets the executor mount each job's workspace.
             ["docker", "run", "-d", "--rm", f"--runtime={RUNTIME}", "--network=none", "--cap-add=SYS_ADMIN",
              f"--cpuset-cpus={min(1, os.cpu_count() - 1)}",
-             "-v", f"{self.dir}:/run/executor", IMAGE],
+             "-v", f"{self.dir}:/run/executor", *self.docker_args, IMAGE],
             check=True, capture_output=True, text=True).stdout.strip()
         deadline = time.monotonic() + STARTUP_TIMEOUT_S
         while not os.path.exists(self.socket):
@@ -49,6 +56,15 @@ class ExecutorContainer:
                 self.__exit__()
                 raise RuntimeError(f"executor did not open its socket:\n{logs}")
             time.sleep(0.2)
+        while (report := self.ready())["ran_at"] is None:
+            if time.monotonic() > deadline + SELF_TEST_TIMEOUT_S:
+                self.__exit__()
+                raise RuntimeError(f"the startup self-test did not finish: {report}")
+            time.sleep(1)
+        if self.require_ready and not report["ready"]:
+            self.__exit__()
+            raise RuntimeError("executor not ready: " + json.dumps(
+                [c for c in report["checks"] if not c["ok"]], indent=2))
         return self
 
     def __exit__(self, *exc):
@@ -68,6 +84,9 @@ class ExecutorContainer:
             while chunk := s.recv(65536):
                 data += chunk
         return json.loads(data)
+
+    def ready(self) -> dict:
+        return self.send(b'{"method": "ready"}\n')
 
     def run_job(self, **job) -> dict:
         return self.send(json.dumps({"method": "run_job", "job": job}).encode() + b"\n")

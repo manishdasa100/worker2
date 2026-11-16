@@ -20,8 +20,8 @@ REPORT_FIELDS = {"execution_id", "language", "task", "status_code", "status_msg"
                  "total_correct", "runtime_ms", "memory_mb", "test_results", "failed_testcase",
                  "compile_error", "runtime_error", "internal_error", "calibration", "created_at"}
 OUTPUT_CAP = 262144     # MAX_OUTPUT_BYTES default
-# CPU an empty jail costs before the program's own clock starts (nsjail, runtime
-# startup under systrap). Ticket 13 subtracts it; until then tests allow for it.
+# CPU a runtime burns before its own clock starts (JVM startup under systrap). The
+# self-test takes an empty jail's share off every reading; the runtime's stays.
 JAIL_CPU_OVERHEAD_MS = 500
 
 executor = None
@@ -237,6 +237,16 @@ class TestJava(Verdicts):
         uptime_ms = int(report["test_results"][0]["std_output"].split()[-1])
         self.assertGreaterEqual(uptime_ms, 1500)
         self.assertLessEqual(report["runtime_ms"], uptime_ms + JAIL_CPU_OVERHEAD_MS, report["runtime_ms"])
+
+
+class TestSandboxOverhead(Verdicts):
+    def test_a_trivial_program_reports_less_than_an_empty_jail_costs(self):
+        overhead = executor.ready()["overhead"]
+        self.assertGreater(overhead["memory_kb"], 1024, overhead)   # nsjail's own footprint
+        report = self.verdict(executor.run_job(**job("c", "int f(void) { return 42; }\n", C_DRIVER)), "ACC")
+        self.assertLessEqual(report["memory_mb"], 2, report)   # a static binary's few pages
+        self.assertLess(report["memory_mb"] * 1024, overhead["memory_kb"], (report, overhead))
+        self.assertLess(report["runtime_ms"], max(overhead["cpu_ms"], 20), (report, overhead))
 
 
 class TestC(Verdicts):

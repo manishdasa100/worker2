@@ -26,7 +26,8 @@ fresh per-jail cgroup before exec; while it runs, a watchdog polls the cgroup
 and kills the jail past its CPU limit, its wall limit (2 x CPU + 1 s) or its
 memory limit (gVisor accounts memory but does not enforce it), tracking the
 memory peak. nsjail's rlimit_cpu and time_limit sit a second above the watchdog
-as backstops. The jail runs as JAIL_USER, mapped to the slot's host uid
+as backstops. Every reading has an empty jail's own cost (overhead_*, measured
+by the containment self-test) taken off first. The jail runs as JAIL_USER, mapped to the slot's host uid
 (SandboxConfig.jail_uid), which owns nothing.
 """
 import asyncio
@@ -110,6 +111,7 @@ class SandboxResult:
     runtime_ms: int              # the driver's own timing if it emitted one, else cpu_ms
     signal: Optional[int]
     peak_memory_mb: int = 0
+    peak_memory_bytes: int = 0
     setup_failed: bool = False   # nsjail couldn't start the command: a worker failure, not a verdict
     output_exceeded: bool = False  # stdout passed the output cap (or stderr flooded); the jail was killed for it
     # Raw components (CALIBRATE reports all of them)
@@ -122,6 +124,10 @@ class NsjailSandbox:
     def __init__(self, config: SandboxConfig, output_limit_bytes: int):
         self.config = config
         self.output_limit_bytes = output_limit_bytes
+        # What an empty jail costs (nsjail and jail setup), measured by the self-test.
+        # Subtracted from every reading, so limits and reports are the program's own.
+        self.overhead_cpu_ms = 0
+        self.overhead_memory_bytes = 0
 
     # ---- public API ---------------------------------------------------------
 
@@ -232,6 +238,7 @@ class NsjailSandbox:
         kill_reason = None   # first limit that killed the jail: output, memory, cpu or wall
         peak_bytes = 0
         memory_bytes = memory_limit * 1024 * 1024
+        base_cpu_ms, base_bytes = self.overhead_cpu_ms, self.overhead_memory_bytes
         watcher = None
 
         def kill_jail(reason):
@@ -246,11 +253,11 @@ class NsjailSandbox:
             # Keeps killing while a limit stays exceeded, so nothing forked mid-kill survives.
             nonlocal peak_bytes
             while True:
-                used = run_cgroup.memory_bytes()
+                used = run_cgroup.memory_bytes() - base_bytes
                 peak_bytes = max(peak_bytes, used)
                 if used > memory_bytes:
                     kill_jail("memory")
-                elif run_cgroup.cpu_time_ms() > time_limit_ms:
+                elif run_cgroup.cpu_time_ms() - base_cpu_ms > time_limit_ms:
                     kill_jail("cpu")
                 elif (time.monotonic() - start) * 1000 > wall_limit_ms:
                     kill_jail("wall")
@@ -297,7 +304,7 @@ class NsjailSandbox:
             # Signal never comes from exit_code (a program may exit 139 itself).
             jail_signal = exits[-1].group(1) if exits else None
             signal = int(jail_signal) if jail_signal else None
-            cpu_ms = run_cgroup.cpu_time_ms()
+            cpu_ms = max(0, run_cgroup.cpu_time_ms() - base_cpu_ms)
 
             # A watchdog kill decides alone. Otherwise, in the spec's order: nsjail's
             # wall backstop, the rlimit's SIGXCPU, then a program that exited on its
@@ -322,7 +329,8 @@ class NsjailSandbox:
                 stdout=stdout, stderr=stderr, nsjail_log=nsjail_log, exit_code=exit_code,
                 time_limit_hit=time_limit_hit, oom_killed=kill_reason == "memory",
                 runtime_ms=runtime_ms, signal=signal,
-                peak_memory_mb=math.ceil(peak_bytes / (1024 * 1024)), wall_ms=elapsed_ms,
+                peak_memory_mb=math.ceil(peak_bytes / (1024 * 1024)), peak_memory_bytes=peak_bytes,
+                wall_ms=elapsed_ms,
                 driver_ms=driver_ms, cpu_ms=cpu_ms,
                 setup_failed=setup_failed, output_exceeded=kill_reason == "output",
             )

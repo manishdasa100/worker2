@@ -30,6 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS=-trimpath \
         go list -export -f '{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}' std \
         > /opt/go-std/importcfg
+# The self-test's probe (probe/probe.go, from judgebox): static, so a jail needs
+# nothing mounted but the binary.
+COPY probe/probe.go /probe/probe.go
+RUN cd /probe && env -i PATH=/usr/local/go/bin:/usr/bin:/bin HOME=/tmp GOCACHE=/tmp/cache \
+        GOTOOLCHAIN=local CGO_ENABLED=0 go build -trimpath -o /probe/probe probe.go
 
 FROM ubuntu:24.04 AS node
 # Node 22 LTS, the official release, checked against nodejs.org's SHASUMS256.txt.
@@ -78,6 +83,7 @@ COPY --from=go /usr/local/go/pkg/tool/linux_amd64/compile /usr/local/go/pkg/tool
 COPY --from=go /opt/go-std /opt/go-std
 COPY --from=node /opt/node /opt/node
 COPY --from=rust /opt/rust /opt/rust
+COPY --from=go /probe/probe /usr/local/bin/probe
 
 WORKDIR /opt/executor
 COPY *.py ./

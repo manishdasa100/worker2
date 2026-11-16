@@ -9,6 +9,14 @@ connection.
       -> {"status": "COMPLETED", "report": {<ExecutionReport fields>}}
       -> {"status": "FAILED", "error": "<why>"}     worker failure: bad message,
                                                        unsupported language, jail fault
+      -> {"status": "NOT_READY", "error": "<why>"}  refused, nothing ran: the latest
+                                                       self-test failed or hasn't finished
+    {"method": "ready"}
+      -> {"ready": bool, "ran_at": <ISO time or null>, "overhead": {...},
+          "checks": [{"name", "ok", "detail", "not_applicable"?}]}   (selftest.py)
+
+The containment self-test runs at startup and every SELF_TEST_INTERVAL_S, holding
+the same lock as jobs, so it never runs beside one.
 
     python3 executor.py      # config from the environment (see Dockerfile)
 """
@@ -24,17 +32,26 @@ from config import load_config
 from judge import Judge
 from models import WORKER_FAILURE_CODES, ExecutionRequest
 from sandbox import workspace
+from selftest import not_ready, self_test
 
 logger = logging.getLogger("executor")
 
 # Worker caps on payload sizes come later (ticket 15); this only bounds one read.
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
+SELF_TEST_INTERVAL_S = int(os.environ.get("SELF_TEST_INTERVAL_S", 600))
 
 
 class Executor:
     def __init__(self, judge: Judge):
         self.judge = judge
         self._one_job = asyncio.Lock()
+        self.report = not_ready("the first self-test has not finished")
+
+    async def self_test_forever(self) -> None:
+        while True:
+            async with self._one_job:
+                self.report = await self_test(self.judge)
+            await asyncio.sleep(SELF_TEST_INTERVAL_S)
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -54,14 +71,19 @@ class Executor:
     async def respond(self, line: bytes) -> dict:
         try:
             message = json.loads(line)
+            if isinstance(message, dict) and message.get("method") == "ready":
+                return self.report
             if not isinstance(message, dict) or message.get("method") != "run_job":
-                raise ValueError("expected method run_job")
+                raise ValueError("expected method run_job or ready")
             request = ExecutionRequest(**message["job"])
         except (ValueError, TypeError, KeyError) as e:
             logger.warning("Malformed request: %s", e)
             return failed(f"malformed run_job message: {e}")
 
         async with self._one_job:
+            if not self.report["ready"]:
+                failing = ", ".join(c["name"] for c in self.report["checks"] if not c["ok"])
+                return {"status": "NOT_READY", "error": f"executor not ready: {failing}"}
             try:
                 report = await self.judge.judge(request)
             except Exception as e:      # e.g. a field of the wrong type
@@ -79,14 +101,13 @@ def failed(error: str) -> dict:
 async def serve(path: str) -> None:
     config = load_config(env_file=None)
     executor = Executor(Judge(config))
-    await executor.judge.warmup()   # ticket 13's self-test smoke runs replace this
     if os.path.exists(path):
         os.unlink(path)          # left by a crashed predecessor
     server = await asyncio.start_unix_server(executor.handle, path, limit=MAX_REQUEST_BYTES)
     os.chmod(path, 0o666)        # the host consumer isn't root; the mounted dir gates access
     logger.info("Executor serving on %s", path)
     async with server:
-        await server.serve_forever()
+        await asyncio.gather(server.serve_forever(), executor.self_test_forever())
 
 
 def main() -> None:

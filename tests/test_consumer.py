@@ -169,6 +169,19 @@ class TestExecutorUnreachable(ConsumerCase):
         self.assertFalse(self.r.exists(self.config.redis.result_stream_key))
 
 
+class TestExecutorNotReady(ConsumerCase):
+    async def test_a_refused_job_is_left_unacked_and_the_slot_takes_no_more(self):
+        self.stubs[0].reply = lambda job: {"status": "NOT_READY", "error": "executor not ready: no_sockets"}
+        for i in range(3):
+            self.submit(job_body(f"job-refused-{i}"))
+        await until(lambda: self.pending() == 1)
+        await asyncio.sleep(1)          # many block_ms cycles: the refusing slot sits out
+
+        self.assertEqual(len(self.stubs[0].jobs), 1)
+        self.assertEqual(self.pending(), 1)
+        self.assertFalse(self.r.exists(self.config.redis.result_stream_key))
+
+
 class TestFreeSlots(ConsumerCase):
     slots = 2
 

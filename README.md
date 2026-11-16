@@ -130,8 +130,13 @@ cp .env.example .env.dev    # Redis + EXECUTOR_SOCKETS
 .venv/bin/python -m unittest tests.test_consumer
 
 # Seam A: builds the image, starts an executor under runsc-executor, talks to its socket
-.venv/bin/python -m unittest tests.test_executor tests.test_adversarial
+.venv/bin/python -m unittest tests.test_executor tests.test_adversarial tests.test_selftest
 ```
+
+Every executor runs its containment self-test (`selftest.py`, with the probe in
+`probe/probe.go`) before it takes work, so each Seam A container takes 1–2 minutes
+to become ready. `tests/test_selftest.py` reads the report back through `ready`,
+on a healthy executor and on ones with a weakened policy or a missing toolchain.
 
 `tests/verdict_matrix.py` drives the judge in-process and is parked.
 `tests/test_adversarial.py` covers containment through Seam A: seccomp in both

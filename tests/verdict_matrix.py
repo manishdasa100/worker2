@@ -80,7 +80,6 @@ async def main():
     config = load_config(env_file=".env.dev")
     cgroups.require()
     judge = Judge(config)
-    await judge.warmup()
     failures = 0
 
     for name, lang, sol, drv, tl, ml, want, *must_say in CASES:

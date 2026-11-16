@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from config import WorkerConfig
-from languages import get_language, LANGUAGES
+from languages import get_language
 from models import (
     ExecutionReport,
     ExecutionRequest,
@@ -30,27 +30,6 @@ from models import (
 from sandbox import NsjailSandbox, SandboxResult, workspace
 
 logger = logging.getLogger(__name__)
-
-# Trivial per-language programs to pre-fault runtimes (interpreter/JVM/compiler/
-# libs) into the page cache so the first real submission doesn't pay cold-cache
-# latency inside its enforced window.
-WARMUP_PROGRAMS = {
-    "python": ("def f():\n    return 42\n",
-               "from solution import f\nprint(f())\n"),
-    "cpp": ("int f() { return 42; }\n",
-            '#include <iostream>\n#include "solution.cpp"\nint main(){ std::cout << f() << std::endl; }\n'),
-    "java": ("public class Solution { static int f() { return 42; } }\n",
-             "public class Main { public static void main(String[] a) { System.out.println(Solution.f()); } }\n"),
-    "c": ("int f(void) { return 42; }\n",
-          '#include <stdio.h>\n#include "solution.c"\nint main(void) { printf("%d\\n", f()); return 0; }\n'),
-    "go": ("package main\n\nfunc f() int { return 42 }\n",
-           'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println(f()) }\n'),
-    "javascript": ("function f() { return 42; }\nmodule.exports = { f };\n",
-                   "const { f } = require('./solution');\nconsole.log(f());\n"),
-    "rust": ("pub fn f() -> i32 { 42 }\n",
-             'mod solution;\nfn main() { println!("{}", solution::f()); }\n'),
-}
-
 
 @dataclass
 class CompileOutcome:
@@ -63,32 +42,6 @@ class Judge:
     def __init__(self, config: WorkerConfig):
         self.config = config
         self.sandbox = NsjailSandbox(config.sandbox, config.execution.max_output_bytes)
-
-    # ---- warmup -------------------------------------------------------------
-
-    async def warmup(self) -> None:
-        """Compile+run a trivial program per language so the first real job runs warm."""
-        started = time.monotonic()
-        for name, lang in LANGUAGES.items():
-            if name not in WARMUP_PROGRAMS:
-                continue
-            user_code, driver_code = WARMUP_PROGRAMS[name]
-            try:
-                with workspace() as warm_dir:
-                    lang.write_files(warm_dir, user_code, driver_code)
-                    outcome = await self._compile(lang, warm_dir)
-                    if not outcome.ok:
-                        logger.warning("Warmup compile failed for %s: %s", name, outcome.error_message[:200])
-                        continue
-                    result = await self.sandbox.run(
-                        command=lang.run_command(256), code_dir=warm_dir, toolchain=lang.run_toolchain,
-                        time_limit_ms=10000, memory_limit=256)
-                    if result.exit_code != 0:
-                        logger.warning("Warmup run failed for %s (exit=%d): %s",
-                                       name, result.exit_code, result.stderr.strip()[:200])
-            except Exception as e:
-                logger.warning("Warmup for %s failed: %s", name, e)
-        logger.info("Language runtimes warmed in %dms", int((time.monotonic() - started) * 1000))
 
     # ---- compile (sandboxed) ------------------------------------------------
 
