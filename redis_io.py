@@ -4,11 +4,13 @@ Redis transport — the single owner of every Redis interaction.
 Collects what worker1 spread across its consumer and dispatcher into one
 cohesive object so the consumer deals in requests/results, not Redis verbs.
 
-Delivery semantics (unchanged from worker1):
+Delivery semantics (worker1's, plus the delivery limit):
   * At-least-once: an entry is XACK+XDEL'd only after its result is published.
     A crash mid-job leaves it in the group PEL; XAUTOCLAIM redelivers it after
     autoclaim_min_idle_ms. `touch()` resets that idle clock for long in-flight
     jobs so they aren't duplicated onto another worker.
+  * An entry reclaimed for its MAX_DELIVERIES-th time is rejected ("retries
+    exhausted") instead of run, so a job that keeps crashing can't loop forever.
   * Result delivery to the backend is its own group's concern — an entry it
     reads but never ACKs stays in its PEL and redelivers.
 
@@ -26,12 +28,14 @@ from redis.exceptions import ResponseError
 from config import RedisConfig
 from models import (
     ExecutionRequest,
-    MalformedMessage,
+    RejectedEntry,
     parse_job_message,
     result_payload,
 )
 
 logger = logging.getLogger(__name__)
+
+MAX_DELIVERIES = 3
 
 
 class RedisTransport:
@@ -43,6 +47,9 @@ class RedisTransport:
             username=config.username or None,
             password=config.password or None,
             decode_responses=True,
+            # Above XREADGROUP's BLOCK: redis-py 8 defaults to 5 s, which races
+            # a 5 s block, and its retries then stall the loop for a minute.
+            socket_timeout=config.block_ms / 1000 + 5,
         )
         self._reclaim_cursor = "0-0"
 
@@ -65,20 +72,31 @@ class RedisTransport:
 
     # ---- receive ------------------------------------------------------------
 
-    def consume(self, max_entries: int) -> Tuple[List[ExecutionRequest], List[MalformedMessage]]:
+    def consume(self, max_entries: int) -> Tuple[List[ExecutionRequest], List[RejectedEntry]]:
         """
-        Next batch to process, at most max_entries (must be >= 1). Reclaimed
-        (crashed-worker) entries first, else a blocking read for fresh ones.
-        BLOCKS up to block_ms — run off-loop.
+        Next batch, at most max_entries (must be >= 1): jobs to run, and entries
+        to publish as FAILED and ack (malformed, or retries exhausted).
+        Reclaimed (crashed-worker) entries first, else a blocking read for
+        fresh ones. BLOCKS up to block_ms — run off-loop.
         """
         entries = self._reclaim(max_entries)
+        exhausted = {}
         if entries:
             logger.info("Reclaimed %d pending entry(ies) via XAUTOCLAIM", len(entries))
+            # Only a reclaim redelivers: XREADGROUP '>' is always a first delivery.
+            deliveries = {stream_id: self._deliveries(stream_id) for stream_id, _ in entries}
+            exhausted = {stream_id: n for stream_id, n in deliveries.items() if n >= MAX_DELIVERIES}
         else:
             entries = self._read_new(max_entries)
             if entries:
                 logger.info("Received %d new entry(ies) via XREADGROUP", len(entries))
-        return self._build(entries)
+        return self._build(entries, exhausted)
+
+    def _deliveries(self, stream_id: str) -> int:
+        """How many times the group has delivered this pending entry (touch's JUSTID claims don't count)."""
+        pending = self.client.xpending_range(self.config.stream_key, self.config.consumer_group,
+                                             min=stream_id, max=stream_id, count=1)
+        return pending[0]["times_delivered"] if pending else 1
 
     def _reclaim(self, count: int) -> List[Tuple[str, dict]]:
         try:
@@ -122,18 +140,24 @@ class RedisTransport:
         _, entries = response[0]           # single stream requested
         return entries or []
 
-    def _build(self, entries) -> Tuple[List[ExecutionRequest], List[MalformedMessage]]:
-        requests, malformed = [], []
+    def _build(self, entries, exhausted) -> Tuple[List[ExecutionRequest], List[RejectedEntry]]:
+        requests, rejected = [], []
         for stream_id, fields in entries:
             body = fields.get("body", "")
+            if stream_id in exhausted:
+                job_id = self._extract_job_id(body)
+                logger.error("[%s] Retries exhausted: delivery %d (stream_id=%s)",
+                             job_id or "unknown", exhausted[stream_id], stream_id)
+                rejected.append(RejectedEntry(stream_id=stream_id, job_id=job_id, error="retries exhausted"))
+                continue
             try:
                 requests.append(parse_job_message(body=body, stream_id=stream_id))
             except (KeyError, ValueError, TypeError) as e:
                 job_id = self._extract_job_id(body)
                 logger.error("Malformed entry (stream_id=%s, job_id=%s): %s",
                              stream_id, job_id or "unknown", e)
-                malformed.append(MalformedMessage(stream_id=stream_id, job_id=job_id, reason=str(e)))
-        return requests, malformed
+                rejected.append(RejectedEntry(stream_id=stream_id, job_id=job_id, error=f"malformed job: {e}"))
+        return requests, rejected
 
     @staticmethod
     def _extract_job_id(body: str) -> Optional[str]:

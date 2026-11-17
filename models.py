@@ -69,11 +69,11 @@ class ExecutionRequest:
 
 
 @dataclass
-class MalformedMessage:
-    """A stream entry whose body could not be parsed."""
+class RejectedEntry:
+    """A stream entry to publish as FAILED and ack without running: malformed, or retries exhausted."""
     stream_id: str
     job_id: Optional[str] = None
-    reason: str = ""
+    error: str = ""
 
 
 @dataclass

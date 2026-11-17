@@ -9,6 +9,7 @@ import dataclasses
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,7 @@ import redis as redis_client
 from config import load_config
 from consumer import Consumer
 from redis_io import RedisTransport
-from tests.stub_executor import StubExecutor
+from tests.stub_executor import StubExecutor, accepted, crash
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -49,6 +50,8 @@ def seam_b_config(slots=1):
     config.redis.heartbeat_key += suffix
     config.redis.block_ms = 100
     config.redis.autoclaim_min_idle_ms = 60000
+    config.redis.heartbeat_interval = 0             # ask executors and beat every loop cycle
+    config.redis.heartbeat_ttl = 2
     sockets_dir = tempfile.mkdtemp(prefix="seam-b-")    # short: AF_UNIX paths max out at 108 bytes
     config.executor_sockets = [os.path.join(sockets_dir, f"slot{i}.sock") for i in range(slots)]
     return config, sockets_dir
@@ -64,25 +67,28 @@ class ConsumerCase(unittest.IsolatedAsyncioTestCase):
     """Runs a consumer on throwaway keys against `slots` stub executors (none listening if not `stubbed`)."""
     slots = 1
     stubbed = True
+    unready = ()                        # indexes of stubs that start out not ready
+    autoclaim_min_idle_ms = 60000
 
     async def asyncSetUp(self):
         self.config, sockets_dir = seam_b_config(self.slots)
+        self.config.redis.autoclaim_min_idle_ms = self.autoclaim_min_idle_ms
         self.addCleanup(shutil.rmtree, sockets_dir, True)
         self.r = redis_for(self.config)
         self.addCleanup(self.r.close)
         self.addCleanup(self.r.delete, self.config.redis.stream_key,
                         self.config.redis.result_stream_key, self.config.redis.heartbeat_key)
         self.stubs = []
-        for path in self.config.executor_sockets if self.stubbed else ():
-            stub = await StubExecutor(path).__aenter__()
+        for i, path in enumerate(self.config.executor_sockets if self.stubbed else ()):
+            stub = await StubExecutor(path, ready=i not in self.unready).__aenter__()
             self.addAsyncCleanup(stub.__aexit__)
             self.stubs.append(stub)
         self.consumer = Consumer(self.config)
-        runner = asyncio.create_task(self.consumer.start())
+        self.runner = asyncio.create_task(self.consumer.start())
 
         async def stop():
             self.consumer._handle_shutdown()
-            await asyncio.wait_for(runner, 10)
+            await asyncio.wait_for(self.runner, 10)
         self.addAsyncCleanup(stop)
         await until(lambda: self.r.exists(self.config.redis.stream_key))   # group created
 
@@ -101,6 +107,9 @@ class ConsumerCase(unittest.IsolatedAsyncioTestCase):
 
     def pending(self) -> int:
         return self.r.xpending(self.config.redis.stream_key, self.config.redis.consumer_group)["pending"]
+
+    def beating(self) -> bool:
+        return bool(self.r.exists(self.config.redis.heartbeat_key))
 
 
 async def until(condition, timeout=10.0):
@@ -155,31 +164,129 @@ class TestAtLeastOnce(ConsumerCase):
         self.assertEqual(self.r.xlen(self.config.redis.stream_key), 1)
 
 
-class TestExecutorUnreachable(ConsumerCase):
-    stubbed = False
+class TestOneSlotNotReady(ConsumerCase):
+    slots = 2
+    unready = (1,)
 
-    async def test_an_unreachable_executor_leaves_the_job_unacked_and_takes_no_more(self):
+    async def test_only_slots_whose_executor_reports_ready_get_work(self):
         for i in range(3):
-            self.submit(job_body(f"job-no-executor-{i}"))
-        await until(lambda: self.pending() == 1)
-        await asyncio.sleep(1)          # many block_ms cycles: the failed slot sits out
+            self.submit(job_body(f"job-ready-{i}"))
+        for i in range(3):
+            self.assertEqual((await self.result(f"job-ready-{i}"))["status"], "COMPLETED")
+
+        self.assertEqual(len(self.stubs[0].jobs), 3)
+        self.assertEqual(self.stubs[1].jobs, [])
+        self.assertTrue(self.beating())
+
+
+class TestReadiness(ConsumerCase):
+    slots = 2
+
+    async def test_with_no_slot_ready_the_heartbeat_lapses_and_no_job_is_read(self):
+        await until(self.beating)
+        for stub in self.stubs:
+            stub.ready = False
+        await asyncio.sleep(0.3)        # a cycle in flight may still read
+        self.submit(job_body("job-waits"))
+        await until(lambda: not self.beating(), timeout=5)     # heartbeat_ttl 2 s
+        self.assertEqual(self.pending(), 0)
+        self.assertEqual([j for stub in self.stubs for j in stub.jobs], [])
+
+        self.stubs[1].ready = True
+        self.assertEqual((await self.result("job-waits"))["status"], "COMPLETED")
+        self.assertTrue(self.beating())
+        self.assertEqual(len(self.stubs[1].jobs), 1)
+
+    async def test_a_job_refused_as_not_ready_is_left_unacked(self):
+        for stub in self.stubs:
+            stub.reply = lambda job: {"status": "NOT_READY", "error": "executor not ready: no_sockets"}
+        self.submit(job_body("job-refused"))
+        await until(lambda: any(stub.jobs for stub in self.stubs))
+        await asyncio.sleep(0.5)
 
         self.assertEqual(self.pending(), 1)
-        self.assertEqual(self.r.xlen(self.config.redis.stream_key), 3)
         self.assertFalse(self.r.exists(self.config.redis.result_stream_key))
 
 
-class TestExecutorNotReady(ConsumerCase):
-    async def test_a_refused_job_is_left_unacked_and_the_slot_takes_no_more(self):
-        self.stubs[0].reply = lambda job: {"status": "NOT_READY", "error": "executor not ready: no_sockets"}
-        for i in range(3):
-            self.submit(job_body(f"job-refused-{i}"))
-        await until(lambda: self.pending() == 1)
-        await asyncio.sleep(1)          # many block_ms cycles: the refusing slot sits out
+class TestCrashedExecutor(ConsumerCase):
+    autoclaim_min_idle_ms = 300
+
+    async def test_a_slot_whose_executor_crashed_takes_no_work_until_it_reports_ready(self):
+        def crash_and_restart(job):
+            self.stubs[0].ready = False         # restarting: self-testing again
+            crash(job)
+        self.stubs[0].reply = crash_and_restart
+        self.submit(job_body("job-crashed"))
+        await until(lambda: self.stubs[0].jobs)
+        self.stubs[0].reply = accepted
+        self.submit(job_body("job-next"))
+        await asyncio.sleep(1)                  # many cycles, past the crashed job's min idle
 
         self.assertEqual(len(self.stubs[0].jobs), 1)
         self.assertEqual(self.pending(), 1)
-        self.assertFalse(self.r.exists(self.config.redis.result_stream_key))
+
+        self.stubs[0].ready = True
+        for job_id in ("job-crashed", "job-next"):
+            self.assertEqual((await self.result(job_id))["status"], "COMPLETED")
+
+
+class TestExecutorUnreachable(ConsumerCase):
+    stubbed = False
+
+    async def test_no_job_is_read_and_there_is_no_heartbeat(self):
+        self.submit(job_body("job-no-executor"))
+        await asyncio.sleep(1)          # many block_ms cycles
+
+        self.assertEqual(self.pending(), 0)
+        self.assertFalse(self.beating())
+
+
+class TestDeliveryLimit(ConsumerCase):
+    autoclaim_min_idle_ms = 300         # redeliver a crashed job quickly
+
+    async def test_a_job_that_crashes_its_executor_every_time_fails_on_its_third_delivery(self):
+        self.stubs[0].reply = crash
+        self.submit(job_body("job-crashes"))
+        result = await self.result("job-crashes")
+
+        self.assertEqual(result, {"job_id": "job-crashes", "status": "FAILED", "worker_type": "GVISOR_WORKER",
+                                  "error": "retries exhausted"})
+        self.assertEqual(len(self.stubs[0].jobs), 2)        # the third delivery is not run
+        await until(lambda: self.pending() == 0 and self.r.xlen(self.config.redis.stream_key) == 0)
+
+    async def test_a_job_whose_executor_dies_mid_run_completes_on_redelivery(self):
+        replies = [crash, accepted]
+        self.stubs[0].reply = lambda job: replies.pop(0)(job)
+        self.submit(job_body("job-redelivered"))
+        result = await self.result("job-redelivered")
+
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(len(self.stubs[0].jobs), 2)
+        await until(lambda: self.pending() == 0)
+
+
+class TestDrain(ConsumerCase):
+    slots = 2
+
+    async def test_sigterm_publishes_the_jobs_in_flight_then_exits_without_reading_more(self):
+        async def slow(job):
+            await asyncio.sleep(1)
+            return accepted(job)
+        for stub in self.stubs:
+            stub.reply = slow
+        for i in range(4):
+            self.submit(job_body(f"job-drain-{i}"))
+        await until(lambda: all(stub.jobs for stub in self.stubs))
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(self.runner, 10)
+
+        ran = [job["job_id"] for stub in self.stubs for job in stub.jobs]
+        self.assertEqual(len(ran), 2)
+        for job_id in ran:
+            self.assertEqual((await self.result(job_id, timeout=0))["status"], "COMPLETED")
+        self.assertEqual(self.pending(), 0)
+        self.assertEqual(self.r.xlen(self.config.redis.stream_key), 2)      # left for other workers
 
 
 class TestFreeSlots(ConsumerCase):

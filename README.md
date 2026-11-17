@@ -18,6 +18,9 @@ before, apart from the additive fields and the `worker_type` rename below.
   before this worker publishes to production.
 - **Liveness**: key `executor:nsjail:heartbeat` (SET+EX, existence-gated). The
   backend only enqueues while it exists. Shared by all workers; never deleted.
+  Refreshed only while at least one slot's executor reports ready.
+- **Retries**: a job delivered a third time (its executor died twice) is
+  published `FAILED` with error `retries exhausted` instead of being run again.
 - **Tasks**: `RUN_CODE` (run all, report each), `SUBMIT_CODE` (stop at first
   fail), `CALIBRATE` (measure a reference solution to derive a problem's limits).
 
@@ -26,8 +29,8 @@ before, apart from the additive fields and the `worker_type` rename below.
 ```
 Consumer, on the host (holds the Redis credentials, no judging code):
 main.py        startup: config, validation, logging
-consumer.py    async loop: free-slot reads, run_job to executors, liveness, keep-alive, draining
-redis_io.py    ALL Redis: consume / ack / touch / beat / publish (at-least-once)
+consumer.py    async loop: readiness, free-slot reads, run_job to executors, liveness, keep-alive, draining
+redis_io.py    ALL Redis: consume / ack / touch / beat / publish (at-least-once, 3-delivery limit)
 
 Executor, one per slot in a runsc container (Dockerfile; no secrets, no network):
 executor.py    answers run_job on its unix socket, one job at a time
@@ -49,7 +52,8 @@ Every execution — **including compilation** — runs inside nsjail, inside an
 executor container under gVisor (`runsc`, `--network=none`). The executor is
 root in its container (with gVisor's `CAP_SYS_ADMIN`, to mount workspaces); each
 jail runs as one unprivileged user mapped to the slot's own host uid
-(`JAIL_UID`, ≥ 61000, default 61001), which owns nothing.
+(`JAIL_UID`, ≥ 61000: 61001 for slot 1, 61002 for slot 2), which owns nothing.
+Each slot's executor is pinned to its own core; core 0 stays with the consumer.
 
 | Boundary | Enforced by |
 |---|---|
@@ -106,13 +110,18 @@ sudo runsc install --runtime=runsc-executor -- --platform=systrap --host-uds=cre
 sudo systemctl reload docker
 
 docker build -t codinglemons-executor .
-docker run -d --runtime=runsc-executor --network=none \
-  -v /run/codinglemons/slot1:/run/executor codinglemons-executor
-# -> socket at /run/codinglemons/slot1/executor.sock
+for i in 1 2; do     # slot i: core i, its own jail uid and socket directory
+  docker run -d --name executor-slot$i --restart=unless-stopped --runtime=runsc-executor \
+    --network=none --cap-add=SYS_ADMIN --cpuset-cpus=$i -e JAIL_UID=6100$i \
+    -v /run/codinglemons/slot$i:/run/executor codinglemons-executor
+done
+# -> sockets at /run/codinglemons/slot{1,2}/executor.sock
 ```
 
 The consumer runs on the host from the venv, with `EXECUTOR_SOCKETS` listing
-one executor socket per slot:
+one executor socket per slot. It sends work only to slots whose executor
+reports ready (each takes 1–2 minutes to self-test after starting) and keeps
+the heartbeat alive only while at least one does:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
@@ -131,6 +140,9 @@ cp .env.example .env.dev    # Redis + EXECUTOR_SOCKETS
 
 # Seam A: builds the image, starts an executor under runsc-executor, talks to its socket
 .venv/bin/python -m unittest tests.test_executor tests.test_adversarial tests.test_selftest
+
+# Seam A, two slots pinned to cores 1 and 2 (needs 3 cores): concurrency and timing fairness
+.venv/bin/python -m unittest tests.test_slots
 ```
 
 Every executor runs its containment self-test (`selftest.py`, with the probe in

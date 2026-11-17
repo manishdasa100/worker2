@@ -41,10 +41,13 @@ class FakeTransport:
 
 
 class FakeExecutors:
-    """Holds each job in its slot until the test finishes it."""
+    """Holds each job in its slot until the test finishes it. Every executor is ready."""
 
     def __init__(self):
         self.running = {}
+
+    async def is_ready(self, socket_path):
+        return True
 
     async def run_job(self, socket_path, request):
         done = self.running[request.job_id] = asyncio.Event()
@@ -77,7 +80,7 @@ class TestReadLoop(unittest.IsolatedAsyncioTestCase):
         consumer = Consumer(config)
         consumer.transport = FakeTransport(batches)
         executors = FakeExecutors()
-        patch = mock.patch("consumer.run_job", executors.run_job)
+        patch = mock.patch.multiple("consumer", run_job=executors.run_job, is_ready=executors.is_ready)
         patch.start()
         runner = asyncio.create_task(consumer.start())
 

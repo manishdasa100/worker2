@@ -1,18 +1,24 @@
 """
 Consumer — the trusted, host-side half of the worker (ADR-0001).
 
-Takes jobs from the queue only while a slot is free, hands each to its slot's
-executor over the run_job socket protocol (executor.py), publishes the
-result, and acks. It holds the Redis credentials and runs no judging code:
+Takes jobs from the queue only while a slot is free and ready, hands each to
+its slot's executor over the run_job socket protocol (executor.py), publishes
+the result, and acks. It holds the Redis credentials and runs no judging code:
 everything Redis lives in RedisTransport, everything verdict in the executor.
-This module is the control flow: liveness, slots, in-flight keep-alive,
-draining, shutdown.
+This module is the control flow: readiness, liveness, slots, in-flight
+keep-alive, draining, shutdown.
+
+Readiness: every heartbeat_interval the consumer asks each slot's executor
+`ready` (its latest self-test). Only ready slots get work, and the heartbeat
+is refreshed only while at least one slot is ready. A slot whose executor
+fails a job counts as not ready until it next answers ready, so a dead or
+restarting executor can't drain the queue into unacked jobs.
 
 At-least-once: a job is acked only after its result is published. A publish
-failure, or an executor that can't be reached or answers nonsense, leaves the
-job unacked, and XAUTOCLAIM redelivers it. So does one refused by an executor
-whose self-test failed. A slot whose executor failed or refused sits out
-SLOT_RETRY_S, so a dead executor can't drain the queue into unacked jobs.
+failure, or an executor that dies, can't be reached, answers nonsense or
+refuses the job as not ready, leaves the job unacked, and XAUTOCLAIM
+redelivers it. Its third delivery is published FAILED, "retries exhausted"
+(RedisTransport).
 """
 import asyncio
 import dataclasses
@@ -22,7 +28,7 @@ import signal
 import time
 
 from config import WorkerConfig
-from models import ExecutionRequest, MalformedMessage
+from models import ExecutionRequest, RejectedEntry
 from redis_io import RedisTransport
 
 logger = logging.getLogger(__name__)
@@ -31,18 +37,15 @@ logger = logging.getLogger(__name__)
 # and stderr.
 # ponytail: up to 256 MiB buffered per slot; size it from ticket 15's input caps.
 MAX_RESPONSE_BYTES = 256 * 1024 * 1024
-# ponytail: a failed executor's slot just sits out this long; ticket 14 gates
-# slots on the executor's `ready` answer instead.
-SLOT_RETRY_S = 30
+# `ready` is answered without waiting for a job, so a slow answer means a sick
+# executor. It delays the beat, so it stays well inside the heartbeat TTL.
+READY_TIMEOUT_S = 2
 
 
-async def run_job(socket_path: str, job: ExecutionRequest) -> dict:
-    """Send one job to the executor at socket_path; return its response."""
+async def ask_executor(socket_path: str, message: dict) -> dict:
+    """One request to the executor at socket_path; its one-line JSON response."""
     reader, writer = await asyncio.open_unix_connection(socket_path, limit=MAX_RESPONSE_BYTES)
     try:
-        fields = dataclasses.asdict(job)
-        del fields["stream_id"]          # Redis bookkeeping stays on the consumer's side
-        message = {"method": "run_job", "job": fields}
         writer.write(json.dumps(message).encode() + b"\n")
         await writer.drain()
         line = await reader.readline()
@@ -50,10 +53,27 @@ async def run_job(socket_path: str, job: ExecutionRequest) -> dict:
         writer.close()
     if not line:
         raise ConnectionError(f"executor at {socket_path} closed without answering")
-    response = json.loads(line)
+    return json.loads(line)
+
+
+async def run_job(socket_path: str, job: ExecutionRequest) -> dict:
+    """Send one job to the executor at socket_path; return its response."""
+    fields = dataclasses.asdict(job)
+    del fields["stream_id"]          # Redis bookkeeping stays on the consumer's side
+    response = await ask_executor(socket_path, {"method": "run_job", "job": fields})
     if response.get("status") == "NOT_READY":    # nothing ran: an executor failure, not a result
         raise ConnectionError(f"executor at {socket_path} refused the job: {response.get('error')}")
     return response
+
+
+async def is_ready(socket_path: str) -> bool:
+    """Whether the executor at socket_path answers `ready` with a passing self-test."""
+    try:
+        report = await asyncio.wait_for(ask_executor(socket_path, {"method": "ready"}), READY_TIMEOUT_S)
+        return report.get("ready") is True
+    except Exception as e:
+        logger.debug("Executor at %s did not answer ready: %s", socket_path, e)
+        return False
 
 
 class Consumer:
@@ -62,8 +82,10 @@ class Consumer:
         self.transport = RedisTransport(config.redis)
         self._running = True
         self._free_slots = list(config.executor_sockets)   # one executor socket per slot
+        self._ready_slots: set = set()     # slots whose executor last answered ready
+        self._failed_slots: set = set()    # slots whose executor failed since the last check began
         self._active_tasks: set = set()
-        self._last_beat = float("-inf")    # -inf so the first cycle always beats
+        self._last_check = float("-inf")   # -inf so the first cycle always checks
 
     async def start(self) -> None:
         logger.info("Consumer starting (slots=%d, consumer=%s)",
@@ -77,27 +99,28 @@ class Consumer:
         consecutive_errors = 0
         while self._running:
             try:
-                await self._maybe_beat()
+                await self._check_slots_and_beat()
 
-                if not self._free_slots:
+                slots = [s for s in self._free_slots if s in self._ready_slots]
+                if not slots:
                     # Leave jobs in the stream for other workers. Waking every
                     # block_ms keeps the beat cycle validate_config assumes.
                     if self._active_tasks:
                         await asyncio.wait(self._active_tasks, timeout=self.config.redis.block_ms / 1000,
                                            return_when=asyncio.FIRST_COMPLETED)
-                    else:       # every slot is sitting out after an executor failure
+                    else:       # every free slot's executor is not ready
                         await asyncio.sleep(self.config.redis.block_ms / 1000)
                     continue
 
-                jobs, malformed = await loop.run_in_executor(
-                    None, self.transport.consume, len(self._free_slots))
+                jobs, rejected = await loop.run_in_executor(None, self.transport.consume, len(slots))
                 consecutive_errors = 0
 
-                for bad in malformed:
-                    self._handle_malformed(bad)
+                for entry in rejected:
+                    self._reject(entry)
 
-                for job in jobs:
-                    task = asyncio.create_task(self._handle_job(job, self._free_slots.pop()))
+                for job, slot in zip(jobs, slots):
+                    self._free_slots.remove(slot)
+                    task = asyncio.create_task(self._handle_job(job, slot))
                     self._active_tasks.add(task)
                     task.add_done_callback(self._active_tasks.discard)
 
@@ -137,10 +160,11 @@ class Consumer:
         finally:
             keepalive.cancel()
             if executor_failed:
-                logger.warning("Executor at %s failed; slot sits out %ds", slot, SLOT_RETRY_S)
-                loop.call_later(SLOT_RETRY_S, self._free_slots.append, slot)
-            else:
-                self._free_slots.append(slot)
+                if slot in self._ready_slots:
+                    logger.warning("Executor at %s failed; no work until it reports ready", slot)
+                self._ready_slots.discard(slot)
+                self._failed_slots.add(slot)    # an answer already in flight doesn't re-admit it
+            self._free_slots.append(slot)
 
     def _publish(self, job_id: str, response: dict) -> None:
         """COMPLETED with the executor's report; FAILED with its error for a worker failure."""
@@ -154,26 +178,45 @@ class Consumer:
         else:
             raise ValueError(f"executor answered with status {status!r}")
 
-    def _handle_malformed(self, bad: MalformedMessage) -> None:
-        if bad.job_id:
+    def _reject(self, entry: RejectedEntry) -> None:
+        """Publish FAILED for an entry that won't be run, then ack it (unacked if the publish fails)."""
+        if entry.job_id:
             try:
-                self.transport.publish(bad.job_id, "FAILED", error=f"malformed job: {bad.reason}")
-                logger.info("[%s] Malformed entry — pushed FAILED", bad.job_id)
+                self.transport.publish(entry.job_id, "FAILED", error=entry.error)
+                logger.info("[%s] Pushed FAILED (%s)", entry.job_id, entry.error)
             except Exception as e:
-                logger.error("[%s] Failed to push FAILED for malformed entry: %s", bad.job_id, e)
+                logger.error("[%s] Failed to push FAILED (%s): %s", entry.job_id, entry.error, e)
+                return
         else:
-            logger.warning("Malformed entry with no job_id — cannot report (reason: %s)", bad.reason)
-        self.transport.ack(bad.stream_id, bad.job_id or "")
+            logger.warning("Entry with no job_id — cannot report (%s)", entry.error)
+        self.transport.ack(entry.stream_id, entry.job_id or "")
 
-    async def _maybe_beat(self) -> None:
-        """Refresh the shared liveness key, at most once per heartbeat_interval. Best effort."""
-        if time.monotonic() - self._last_beat < self.config.redis.heartbeat_interval:
+    async def _check_slots_and_beat(self) -> None:
+        """
+        At most once per heartbeat_interval: ask every slot's executor whether
+        it is ready, then refresh the shared liveness key if any is. With none
+        ready the key is left to expire, never deleted. A failed beat is retried
+        on the next loop cycle.
+        """
+        if time.monotonic() - self._last_check < self.config.redis.heartbeat_interval:
+            return
+        self._last_check = time.monotonic()
+        self._failed_slots.clear()
+        slots = self.config.executor_sockets
+        answers = await asyncio.gather(*(is_ready(s) for s in slots))
+        ready = {s for s, ok in zip(slots, answers) if ok} - self._failed_slots
+        for s in ready - self._ready_slots:
+            logger.info("Executor at %s is ready", s)
+        for s in self._ready_slots - ready:
+            logger.warning("Executor at %s is not ready; it gets no work", s)
+        self._ready_slots = ready
+        if not ready:
             return
         try:
             await asyncio.get_running_loop().run_in_executor(None, self.transport.beat)
-            self._last_beat = time.monotonic()
         except Exception as e:
             logger.warning("Liveness heartbeat failed: %s", e)
+            self._last_check = float("-inf")
 
     async def _keepalive_loop(self, job: ExecutionRequest) -> None:
         """Touch the in-flight entry periodically (a third of the autoclaim threshold)."""

@@ -6,7 +6,8 @@ Seam A: a real executor container under runsc, reached only through its socket.
         executor.ready()                                  # -> the latest self-test report
 
 Entering waits for the startup self-test and fails unless it passed; pass
-require_ready=False to inspect a failing one. docker_args go to `docker run`.
+require_ready=False to inspect a failing one. docker_args go to `docker run`;
+cpu is the core it is pinned to (slot 1's, core 1, by default).
 
 Builds the image from this checkout first (cached, so quick when unchanged).
 EXECUTOR_RUNTIME picks the Docker runtime: it must be runsc with
@@ -29,8 +30,12 @@ JOB_TIMEOUT_S = 300
 
 
 class ExecutorContainer:
-    def __init__(self, docker_args=(), require_ready=True):
+    def __init__(self, docker_args=(), require_ready=True, cpu=None):
         self.docker_args = list(docker_args)
+        # Slot 1's core, as in production (spec: the consumer keeps core 0, slot i
+        # is pinned to core i); unpinned, JIT threads run in parallel and CPU time
+        # outgrows wall time.
+        self.cpu = min(1, os.cpu_count() - 1) if cpu is None else cpu
         self.require_ready = require_ready
         self.dir = tempfile.mkdtemp(prefix="executor-")   # short: AF_UNIX paths max out at 108 bytes
         os.chmod(self.dir, 0o777)                         # the container's root binds the socket here
@@ -42,11 +47,9 @@ class ExecutorContainer:
         subprocess.run(["docker", "build", "-q", "--network=host", "-t", IMAGE, ROOT],
                        check=True, stdout=subprocess.DEVNULL)
         self.container = subprocess.run(
-            # Slot 0's core, as in production (spec: slot i pinned to core i+1);
-            # unpinned, JIT threads run in parallel and CPU time outgrows wall time.
             # SYS_ADMIN (gVisor's, not the host's) lets the executor mount each job's workspace.
             ["docker", "run", "-d", "--rm", f"--runtime={RUNTIME}", "--network=none", "--cap-add=SYS_ADMIN",
-             f"--cpuset-cpus={min(1, os.cpu_count() - 1)}",
+             f"--cpuset-cpus={self.cpu}",
              "-v", f"{self.dir}:/run/executor", *self.docker_args, IMAGE],
             check=True, capture_output=True, text=True).stdout.strip()
         deadline = time.monotonic() + STARTUP_TIMEOUT_S
