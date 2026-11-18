@@ -3,15 +3,19 @@ Language handler interface.
 
 A handler is declarative — it does NOT run subprocesses. It says:
   1. how to lay source files out in the code dir   (write_files)
-  2. the command that compiles them, if any         (compile_command)
+  2. the commands that compile them, in order       (compile_commands)
   3. the command that runs them                      (run_command)
   4. how to probe its runtime version                (version_command, for CALIBRATE)
 
-Both compile_command and run_command execute INSIDE the jail (cwd=/code, the
+Compile and run commands execute INSIDE the jail (cwd=/code, the
 code dir bind-mounted there) — so paths are sandbox-internal (/code/..., or
-relative to /code). The judge orchestrates: sandbox.compile(compile_command())
-then sandbox.run(run_command()). This is the worker2 change that closes the
+relative to /code). The judge orchestrates: sandbox.compile() on each compile command
+in turn, then sandbox.run(run_command()). This is the worker2 change that closes the
 host-side compile hole: the compiler never runs on the host.
+
+What a jail of each phase gets besides the workspace, as a Toolchain:
+  compile_toolchain   — what the compile command needs.
+  run_toolchain       — what the run command needs. Static binaries need nothing.
 
 Per-language fairness knobs (applied by the judge):
   time_multiplier     — the request's time budget is calibrated for compiled
@@ -24,10 +28,23 @@ Per-language fairness knobs (applied by the judge):
                         before the cgroup OOM killer). Lets the judge class it MLE.
 """
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List
+
+LOADER = "/lib64/ld-linux-x86-64.so.2"
+# What any dynamically linked program needs: the loader and the shared libraries.
+SHARED_LIBS = (LOADER, "/usr/lib/x86_64-linux-gnu")
+
+
+@dataclass(frozen=True)
+class Toolchain:
+    mounts: tuple = ()   # paths bound read-only, at the same path inside the jail
+    env: tuple = ()      # extra "NAME=value" variables
 
 
 class BaseLanguage(ABC):
+    compile_toolchain = Toolchain()
+    run_toolchain = Toolchain()
     time_multiplier: float = 1.0
     memory_baseline_mb: int = 0
     oom_error_markers: tuple = ()
@@ -42,8 +59,8 @@ class BaseLanguage(ABC):
         ...
 
     @abstractmethod
-    def compile_command(self) -> Optional[List[str]]:
-        """Command to compile inside the jail, or None for interpreted languages."""
+    def compile_commands(self) -> List[List[str]]:
+        """Compile commands, each run in a fresh compile jail over the same workspace; the first to fail ends the compile. Empty if nothing to compile."""
         ...
 
     @abstractmethod

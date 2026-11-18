@@ -1,14 +1,13 @@
 """
-Entry point for the worker2 service.
+Entry point for the consumer, the host side of the worker (consumer.py).
 
 Usage:
     python main.py --env dev     # reads .env.dev
     python main.py --env prod    # reads .env.prod
     python main.py               # reads .env
 
-Requires a delegated cgroup v2 subtree (rootless nsjail):
-    dev   — ./run.sh  (wraps: systemd-run --user --scope -p Delegate=yes ...)
-    prod  — a systemd unit with User=<worker> and Delegate=memory pids
+Runs on the host from the venv and holds the Redis credentials. Judging
+happens in the executors (executor.py), reached through EXECUTOR_SOCKETS.
 """
 import argparse
 import asyncio
@@ -20,9 +19,8 @@ import sys
 import redis as redis_client
 from redis.exceptions import AuthenticationError, ConnectionError as RedisConnectionError
 
-from cgroups import CgroupDelegation
 from config import WorkerConfig, load_config
-from dispatcher import Dispatcher
+from consumer import Consumer
 
 
 def setup_logging() -> None:
@@ -53,16 +51,10 @@ def setup_logging() -> None:
 
 def validate_config(config: WorkerConfig) -> None:
     errors = []
-    if not config.sandbox.nsjail_path:
-        errors.append("NSJAIL_PATH is required")
-    for label, path in (("NSJAIL_RUN_CONFIG_PATH", config.sandbox.run_config_path),
-                        ("NSJAIL_COMPILE_CONFIG_PATH", config.sandbox.compile_config_path)):
-        if not path:
-            errors.append(f"{label} is required")
-        elif not os.path.isfile(path):
-            errors.append(f"{label} does not exist: {path}")
     if not config.redis.host:
         errors.append("REDIS_HOST is required")
+    if not config.executor_sockets:
+        errors.append("EXECUTOR_SOCKETS needs at least one executor socket")
     for label, val in (("REDIS_STREAM_KEY", config.redis.stream_key),
                        ("REDIS_CONSUMER_GROUP", config.redis.consumer_group),
                        ("REDIS_RESULT_STREAM_KEY", config.redis.result_stream_key),
@@ -110,35 +102,18 @@ def main() -> None:
     logger.info("Loaded configuration from '%s'", env_file)
 
     validate_config(config)
-    os.makedirs(config.execution.temp_dir, exist_ok=True)
 
-    delegation = CgroupDelegation.try_setup()
-    if delegation is None:
-        logger.error("No delegated cgroup v2 subtree — cannot run sandboxes. Use ./run.sh (dev) or a "
-                     "systemd unit with Delegate=memory pids (prod).")
-        sys.exit(1)
-
-    logger.info("=== CodingLemons worker2 ===")
-    logger.info("  Delegated cgroup: %s", delegation.root)
+    logger.info("=== CodingLemons worker2 consumer ===")
     logger.info("  Redis:           %s:%d", config.redis.host, config.redis.port)
     logger.info("  Submit stream:   %s (group %s)", config.redis.stream_key, config.redis.consumer_group)
     logger.info("  Result stream:   %s (maxlen=%s)", config.redis.result_stream_key,
                 config.redis.result_stream_maxlen or "unbounded")
     logger.info("  Heartbeat:       %s (every %ds, ttl %ds)", config.redis.heartbeat_key,
                 config.redis.heartbeat_interval, config.redis.heartbeat_ttl)
-    logger.info("  Run profile:     %s", config.sandbox.run_config_path)
-    logger.info("  Compile profile: %s", config.sandbox.compile_config_path)
-    logger.info("  Max concurrent:  %d", config.execution.max_concurrent)
-    logger.info("  Time limit:      %dms  Memory: %dMB", config.execution.default_time_limit_ms,
-                config.execution.default_memory_limit)
-    logger.info("============================")
+    logger.info("  Executors:       %s", ", ".join(config.executor_sockets))
+    logger.info("=====================================")
 
-    cores = os.cpu_count() or 1
-    if config.execution.max_concurrent >= cores:
-        logger.warning("MAX_CONCURRENT (%d) >= cores (%d) — sandboxes will contend for CPU and inflate "
-                       "runtimes. Recommend <= cores-1.", config.execution.max_concurrent, cores)
-
-    asyncio.run(Dispatcher(config, delegation).start())
+    asyncio.run(Consumer(config).start())
 
 
 if __name__ == "__main__":

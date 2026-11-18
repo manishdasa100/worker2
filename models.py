@@ -1,17 +1,19 @@
 """
 Wire models + (de)serialization.
 
-The payloads here are a FIXED CONTRACT with the backend and are byte-for-byte
-identical to worker1:
+The payloads here are a FIXED CONTRACT with the backend. They match worker1's
+except for the spec's additive changes and the worker_type rename:
 
   Inbound (submission stream entry `body` field, JSON):
     {"jobId", "language", "userCode"(b64), "driverCode"(b64), "task",
      "timeLimit"(CPU-ms), "memoryLimit"(MB), "testCases":[{input,expectedOutput}],
-     "slowCode"(b64, CALIBRATE), "hogCode"(b64, CALIBRATE)}
+     "slowCode"(b64, CALIBRATE), "hogCode"(b64, CALIBRATE),
+     "checker": {"mode": exact|tokens|float, "absEpsilon"?, "relEpsilon"?}}   # optional
 
   Outbound (result stream entry `body` field, JSON):
-    {"job_id", "status": COMPLETED|FAILED, "worker_type": "NSJAIL_WORKER",
-     "execution_report": <JSON string>}   # execution_report omitted on FAILED
+    {"job_id", "status": COMPLETED|FAILED, "worker_type": "GVISOR_WORKER",
+     "execution_report": <JSON string>,   # COMPLETED only
+     "error": <string>}                   # FAILED only, optional
 """
 import base64
 import json
@@ -20,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
-WORKER_TYPE = "NSJAIL_WORKER"   # Identifies this producer on the result stream (contract)
+WORKER_TYPE = "GVISOR_WORKER"   # Identifies this producer on the result stream (contract)
 
 
 class StatusCode(str, Enum):
@@ -34,6 +36,10 @@ class StatusCode(str, Enum):
     RUNTIME_ERROR = "RE"
     INTERNAL_ERROR = "IE"
     UNSUPPORTED_LANGUAGE = "UL"
+
+
+# A report with one of these is a worker failure (FAILED), not a verdict.
+WORKER_FAILURE_CODES = (StatusCode.INTERNAL_ERROR, StatusCode.UNSUPPORTED_LANGUAGE)
 
 
 class TestStatus(str, Enum):
@@ -61,14 +67,15 @@ class ExecutionRequest:
     stream_id: str = ""                    # Redis entry ID (for XACK + XDEL)
     slow_code: str = ""                    # CALIBRATE: too-slow adversary (time gap check)
     hog_code: str = ""                     # CALIBRATE: memory-hungry adversary (mem gap check)
+    checker: Optional[dict] = None         # {mode, absEpsilon?, relEpsilon?}; None is exact
 
 
 @dataclass
-class MalformedMessage:
-    """A stream entry whose body could not be parsed."""
+class RejectedEntry:
+    """A stream entry to publish as FAILED and ack without running: malformed, or retries exhausted."""
     stream_id: str
     job_id: Optional[str] = None
-    reason: str = ""
+    error: str = ""
 
 
 @dataclass
@@ -83,6 +90,8 @@ class TestCaseResult:
     runtime_ms: int = 0
     memory_mb: int = 0
     error_message: Optional[str] = None
+    reason: Optional[str] = None           # Why it didn't pass: "exit code 1", "signal SIGSEGV", ...
+    cpu_ms: int = 0
 
 
 @dataclass
@@ -127,7 +136,7 @@ def parse_job_message(body: str, stream_id: str = "") -> ExecutionRequest:
 
     camelCase is the backend's shape; snake_case timeLimit/memoryLimit are
     accepted for compatibility. timeLimit is CPU-ms, memoryLimit is MB; either
-    may be null/absent (defaults apply, and the judge clamps to worker caps).
+    may be null/absent (defaults apply). The judge validates limits and checker.
     Raises KeyError/ValueError/TypeError on a malformed body.
     """
     data = json.loads(body)
@@ -153,17 +162,21 @@ def parse_job_message(body: str, stream_id: str = "") -> ExecutionRequest:
         stream_id=stream_id,
         slow_code=safe_base64_decode(slow_code) if slow_code else "",
         hog_code=safe_base64_decode(hog_code) if hog_code else "",
+        checker=data.get("checker"),
     )
 
 
-def result_payload(job_id: str, status: str, report_json: Optional[str] = None) -> str:
+def result_payload(job_id: str, status: str, report_json: Optional[str] = None,
+                   error: Optional[str] = None) -> str:
     """
     Build the result stream entry's `body` JSON (worker -> backend).
 
     status is COMPLETED (report attached) or FAILED (no report — worker-level
-    failure, not retriable as a verdict). Matches worker1's envelope exactly.
+    failure, not a verdict — optionally with the error saying why).
     """
     payload = {"job_id": job_id, "status": status, "worker_type": WORKER_TYPE}
     if report_json is not None:
         payload["execution_report"] = report_json
+    if error is not None:
+        payload["error"] = error
     return json.dumps(payload)

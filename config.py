@@ -11,13 +11,16 @@ Grouped into four dataclasses:
     RedisConfig     — stream transport + liveness heartbeat (the backend contract)
     SandboxConfig   — nsjail binary, the run/compile jail profiles, timing backstop
     ExecutionConfig — limits, fairness caps, calibration, compile budgets
-    WorkerConfig    — top-level container
+    WorkerConfig    — top-level container, plus the consumer's executor sockets
+
+The consumer reads RedisConfig and EXECUTOR_SOCKETS; the executor reads
+SandboxConfig and ExecutionConfig from its container's environment.
 """
 import os
 import socket
 from dataclasses import dataclass, field
+from typing import List, Optional
 
-from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +41,6 @@ class RedisConfig:
     consumer_name: str = ""               # Blank -> "<hostname>:<pid>"
     block_ms: int = 5000                  # XREADGROUP BLOCK timeout
     autoclaim_min_idle_ms: int = 60000    # Reclaim entries idle longer than this
-    read_count: int = 4                   # Entries per XREADGROUP / XAUTOCLAIM
 
     # Outbound results (worker XADDs, backend consumes via its own group)
     result_stream_key: str = "stream:execution-results"
@@ -58,31 +60,28 @@ class SandboxConfig:
     nsjail_path: str = ""
     run_config_path: str = ""             # Jail profile for running user code
     compile_config_path: str = ""         # Jail profile for the compiler
-    java_path: str = "/usr/lib/jvm/java-11-openjdk-amd64/bin/java"
-    # TLE is enforced on CPU time (cgroup counter). The wall clock is only a
-    # backstop at CPU-limit + this, catching sleepers/deadlocks (no CPU burn).
-    wall_clock_grace: int = 5
+    jail_uid: int = 61001                 # This slot's host uid (>= 61000, owns nothing) jails map to
 
 
 @dataclass
 class ExecutionConfig:
-    max_concurrent: int = 4
-    default_time_limit_ms: int = 5000     # Max CPU-ms budget per test case (clamps request)
-    default_memory_limit: int = 128       # MB per sandbox (clamps request)
+    default_time_limit_ms: int = 5000     # Max CPU-ms budget per test case (a job over it fails)
+    default_memory_limit: int = 128       # Max MB budget per sandbox (a job over it fails)
     max_output_bytes: int = 262144        # 256 KB output cap
     max_output_lines: int = 5000
     max_testcases: int = 50               # Worker backstop on job duration
-    temp_dir: str = "/tmp/codinglemons"
+    # Payload caps, from judgebox's. A job over any of them is a worker failure.
+    max_user_code_bytes: int = 256 * 1024
+    max_driver_code_bytes: int = 256 * 1024
+    max_input_bytes: int = 16 * 1024 * 1024        # one test case's input
+    max_total_input_bytes: int = 48 * 1024 * 1024  # every test case's input plus expected output
 
     # --- Sandboxed compilation (NEW in worker2) ---
     # The compiler runs inside a jail with only the toolchain + code dir
     # visible and no network, so a malicious source can't read host files at
     # compile time or exhaust host RAM. These bound that jail.
     compile_timeout: int = 30             # CPU-seconds for the compile step
-    compile_memory_limit: int = 512       # MB for the compile jail (g++/javac are hungry)
-
-    # Re-warm runtimes after this long idle (0 disables). Boot warmup always runs.
-    warmup_idle_seconds: int = 1800
+    compile_memory_limit: int = 768       # MB for the compile jail (rustc/javac are hungry)
 
     # --- CALIBRATE task ---
     calibration_runs: int = 5
@@ -100,6 +99,8 @@ class WorkerConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     max_consecutive_errors: int = 5       # Shut down after this many back-to-back loop errors
+    # Consumer: one executor socket per slot; the slot count is their number.
+    executor_sockets: List[str] = field(default_factory=lambda: ["/run/codinglemons/slot1/executor.sock"])
 
 
 def _int(name: str, default: int) -> int:
@@ -110,7 +111,7 @@ def _float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
-def load_config(env_file: str) -> WorkerConfig:
+def load_config(env_file: Optional[str]) -> WorkerConfig:
     """
     Build a WorkerConfig from an env file + os.environ (real env wins).
 
@@ -118,15 +119,21 @@ def load_config(env_file: str) -> WorkerConfig:
         COMPILE_TIMEOUT, COMPILE_MEMORY_LIMIT  — sandboxed-compile budgets
         NSJAIL_RUN_CONFIG_PATH                 — runtime jail profile
         NSJAIL_COMPILE_CONFIG_PATH             — compile jail profile
+        JAIL_UID                               — the slot's host uid jails run as
     NSJAIL_CONFIG_PATH (worker1's single profile) is still accepted as a
     fallback for the run profile.
+
+    env_file None reads os.environ alone: the executor image has no env file
+    (and no python-dotenv).
     """
-    if not os.path.isfile(env_file):
-        raise SystemExit(
-            f"[config] Required env file '{env_file}' not found. "
-            f"Copy .env.example to {env_file} and fill in your values."
-        )
-    load_dotenv(env_file, override=False)
+    if env_file is not None:
+        if not os.path.isfile(env_file):
+            raise SystemExit(
+                f"[config] Required env file '{env_file}' not found. "
+                f"Copy .env.example to {env_file} and fill in your values."
+            )
+        from dotenv import load_dotenv
+        load_dotenv(env_file, override=False)
 
     c = WorkerConfig()
 
@@ -143,7 +150,6 @@ def load_config(env_file: str) -> WorkerConfig:
         r.consumer_name = f"{socket.gethostname()}:{os.getpid()}"
     r.block_ms = _int("REDIS_BLOCK_MS", r.block_ms)
     r.autoclaim_min_idle_ms = _int("REDIS_AUTOCLAIM_MIN_IDLE_MS", r.autoclaim_min_idle_ms)
-    r.read_count = _int("REDIS_READ_COUNT", r.read_count)
     r.result_stream_key = os.environ.get("REDIS_RESULT_STREAM_KEY", r.result_stream_key)
     r.result_stream_maxlen = _int("REDIS_RESULT_STREAM_MAXLEN", r.result_stream_maxlen)
     r.heartbeat_key = os.environ.get("REDIS_HEARTBEAT_KEY", r.heartbeat_key)
@@ -159,21 +165,19 @@ def load_config(env_file: str) -> WorkerConfig:
         os.environ.get("NSJAIL_CONFIG_PATH", s.run_config_path),
     )
     s.compile_config_path = os.environ.get("NSJAIL_COMPILE_CONFIG_PATH", s.compile_config_path)
-    s.java_path = os.environ.get("JAVA_PATH", s.java_path)
-    s.wall_clock_grace = _int("WALL_CLOCK_GRACE", s.wall_clock_grace)
+    s.jail_uid = _int("JAIL_UID", s.jail_uid)
+    if s.jail_uid < 61000:
+        raise SystemExit(f"[config] JAIL_UID must be a dedicated uid >= 61000, got {s.jail_uid}")
 
     # --- Execution ---
     e = c.execution
-    e.max_concurrent = _int("MAX_CONCURRENT", e.max_concurrent)
     e.default_time_limit_ms = _int("DEFAULT_TIME_LIMIT_MS", e.default_time_limit_ms)
     e.default_memory_limit = _int("DEFAULT_MEMORY_LIMIT", e.default_memory_limit)
     e.max_output_bytes = _int("MAX_OUTPUT_BYTES", e.max_output_bytes)
     e.max_output_lines = _int("MAX_OUTPUT_LINES", e.max_output_lines)
     e.max_testcases = _int("MAX_TESTCASES", e.max_testcases)
-    e.temp_dir = os.environ.get("TEMP_DIR", e.temp_dir)
     e.compile_timeout = _int("COMPILE_TIMEOUT", _int("COMPILATION_TIMEOUT", e.compile_timeout))
     e.compile_memory_limit = _int("COMPILE_MEMORY_LIMIT", e.compile_memory_limit)
-    e.warmup_idle_seconds = _int("WARMUP_IDLE_SECONDS", e.warmup_idle_seconds)
     e.calibration_runs = _int("CALIBRATION_RUNS", e.calibration_runs)
     e.calibration_time_limit = _int("CALIBRATION_TIME_LIMIT", e.calibration_time_limit)
     e.calibration_memory_limit = _int("CALIBRATION_MEMORY_LIMIT", e.calibration_memory_limit)
@@ -183,4 +187,7 @@ def load_config(env_file: str) -> WorkerConfig:
     e.calibration_memory_floor_mb = _int("CALIBRATION_MEMORY_FLOOR_MB", e.calibration_memory_floor_mb)
 
     c.max_consecutive_errors = _int("MAX_CONSECUTIVE_ERRORS", c.max_consecutive_errors)
+    sockets = os.environ.get("EXECUTOR_SOCKETS")
+    if sockets is not None:
+        c.executor_sockets = [p.strip() for p in sockets.split(",") if p.strip()]
     return c

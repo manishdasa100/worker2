@@ -1,10 +1,17 @@
 import os
-from typing import List, Optional
+from typing import List
 
-from languages.base import BaseLanguage
+from languages.base import BaseLanguage, SHARED_LIBS, Toolchain
 
-JAVA_PATH = os.environ.get("JAVA_PATH", "/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+JAVA_PATH = os.environ.get("JAVA_PATH", "/usr/lib/jvm/java-21-openjdk-amd64/bin/java")
 JAVAC_PATH = os.path.join(os.path.dirname(JAVA_PATH), "javac")
+JAVA_HOME = os.path.dirname(os.path.dirname(JAVA_PATH))
+TOOLCHAIN = Toolchain(
+    # The JDK's lib/jvm.cfg and conf/ are symlinks into /etc/java-21-openjdk.
+    mounts=(JAVA_HOME, "/etc/java-21-openjdk", *SHARED_LIBS),
+    # java and javac find libjli.so through $ORIGIN, which the loader resolves
+    # from /proc/self/exe; jails have no /proc, so name the directory.
+    env=(f"LD_LIBRARY_PATH={JAVA_HOME}/lib",))
 
 
 class JavaLanguage(BaseLanguage):
@@ -12,10 +19,13 @@ class JavaLanguage(BaseLanguage):
     Layout in code_dir:  Solution.java (user), Main.java (driver), *.class (compiled).
     Compiled inside the jail with javac; run with java -cp /code Main.
     """
+    compile_toolchain = TOOLCHAIN
+    run_toolchain = TOOLCHAIN
     # JIT-compiled: ~2x the C++ budget absorbs JVM startup (~100-250ms) + warmup.
-    # JVM itself ~40-60 MB (metaspace, code cache, GC) before user code allocates.
+    # An empty main peaks at ~180 MB under gVisor (measured, ticket 07; flags
+    # barely move it), so start from judgebox's 192. Confirmed by CALIBRATE (ticket 16).
     time_multiplier = 2.0
-    memory_baseline_mb = 64
+    memory_baseline_mb = 192
     oom_error_markers = ("java.lang.OutOfMemoryError",)   # heap death below cgroup limit, exit 1
 
     @property
@@ -28,17 +38,20 @@ class JavaLanguage(BaseLanguage):
         with open(os.path.join(code_dir, "Main.java"), "w") as f:
             f.write(driver_code)
 
-    def compile_command(self) -> Optional[List[str]]:
+    def compile_commands(self) -> List[List[str]]:
         # cwd=/code inside the jail; writes *.class there for the run jail.
-        return [JAVAC_PATH, "Main.java", "Solution.java"]
+        return [[JAVAC_PATH, "Main.java", "Solution.java"]]
 
     def run_command(self, memory_limit_mb: int) -> List[str]:
         # -Xmx = the cgroup limit, so heap+overhead crosses the cgroup ceiling and
         # memory-hungry solutions die by cgroup OOM (-> MLE) rather than an
         # artificially small heap aborting far below it. The JVM can't self-size
         # (/sys isn't mounted), so set it explicitly.
+        # SerialGC + one processor: no GC/JIT thread pools sized to the host's
+        # cores, so CPU time and startup memory belong to the solution.
         return [
             JAVA_PATH,
+            "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1", "-XX:-UsePerfData",
             "-Xms8m", f"-Xmx{memory_limit_mb}m",
             "-XX:MaxMetaspaceSize=64m",
             "-cp", "/code", "Main",

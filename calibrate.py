@@ -47,7 +47,7 @@ class Calibrator:
 
         entries, failure = await self._measure_solution(
             job_id, "reference", lang, command, code_dir,
-            request.test_cases, runs, time_limit_ms, memory_limit)
+            request.test_cases, runs, time_limit_ms, memory_limit, request.checker)
         calibration["testcases"] = entries
         verified = [e for e in entries if e["verified"]]
 
@@ -77,7 +77,7 @@ class Calibrator:
         return report
 
     async def _measure_solution(self, job_id, label, lang, command, code_dir,
-                                test_cases, runs, time_limit_ms, memory_limit):
+                                test_cases, runs, time_limit_ms, memory_limit, checker):
         entries = []
         for i, test_case in enumerate(test_cases):
             input_data = test_case.get("input", "")
@@ -87,11 +87,13 @@ class Calibrator:
             logger.info("[%s] Calibrating %s test case %d/%d (%d runs)",
                         job_id, label, i + 1, len(test_cases), runs)
             for run_no in range(1, runs + 1):
-                sr = await self.sandbox.run(command=command, code_dir=code_dir, stdin_data=input_data,
+                sr = await self.sandbox.run(command=command, code_dir=code_dir, toolchain=lang.run_toolchain,
+                                            stdin_data=input_data,
                                             time_limit_ms=time_limit_ms, memory_limit=memory_limit)
-                tc = self.judge._evaluate_test_case(i, sr, input_data, expected, lang.oom_error_markers)
+                tc = self.judge._evaluate_test_case(i, sr, input_data, expected, lang.oom_error_markers,
+                                                    checker)
                 entry["samples"].append({"run": run_no, "runtime_ms": sr.runtime_ms, "driver_ms": sr.driver_ms,
-                                         "wrapper_ms": sr.wrapper_ms, "wall_ms": sr.wall_ms,
+                                         "wall_ms": sr.wall_ms,
                                          "cpu_ms": sr.cpu_ms, "memory_mb": sr.peak_memory_mb})
                 if tc.status != TestStatus.PASSED:
                     return entries, tc
@@ -174,7 +176,8 @@ class Calibrator:
                 return None
             cmd = lang.run_command(mem_cap_mb)
             entries, _ = await self._measure_solution(request.job_id, label, lang, cmd, adv_dir,
-                                                       request.test_cases, runs, cpu_cap_ms, mem_cap_mb)
+                                                       request.test_cases, runs, cpu_cap_ms, mem_cap_mb,
+                                                       request.checker)
             return entries
         finally:
             shutil.rmtree(adv_dir, ignore_errors=True)

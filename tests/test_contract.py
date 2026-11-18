@@ -10,7 +10,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import parse_job_message, result_payload, safe_base64_decode
+from models import (ExecutionReport, TestCaseResult, TestStatus, parse_job_message, result_payload,
+                    safe_base64_decode)
 
 
 def b64(s): return base64.b64encode(s.encode()).decode()
@@ -54,6 +55,13 @@ class TestInboundParse(unittest.TestCase):
         self.assertEqual(r.slow_code, "slow")
         self.assertEqual(r.hog_code, "hog")
 
+    def test_checker_is_optional(self):
+        self.assertIsNone(parse_job_message(self._msg()).checker)
+
+    def test_checker_is_passed_through(self):
+        checker = {"mode": "float", "absEpsilon": 1e-9, "relEpsilon": 1e-4}
+        self.assertEqual(parse_job_message(self._msg(checker=checker)).checker, checker)
+
     def test_malformed_raises(self):
         with self.assertRaises((KeyError, ValueError, TypeError)):
             parse_job_message('{"not":"a job"}')
@@ -66,12 +74,25 @@ class TestOutboundPayload(unittest.TestCase):
     def test_completed_has_report(self):
         p = json.loads(result_payload("j1", "COMPLETED", '{"x":1}'))
         self.assertEqual(p, {"job_id": "j1", "status": "COMPLETED",
-                             "worker_type": "NSJAIL_WORKER", "execution_report": '{"x":1}'})
+                             "worker_type": "GVISOR_WORKER", "execution_report": '{"x":1}'})
 
     def test_failed_omits_report(self):
         p = json.loads(result_payload("j1", "FAILED"))
-        self.assertEqual(p, {"job_id": "j1", "status": "FAILED", "worker_type": "NSJAIL_WORKER"})
+        self.assertEqual(p, {"job_id": "j1", "status": "FAILED", "worker_type": "GVISOR_WORKER"})
         self.assertNotIn("execution_report", p)
+
+    def test_failed_carries_an_optional_error(self):
+        p = json.loads(result_payload("j1", "FAILED", error="retries exhausted"))
+        self.assertEqual(p, {"job_id": "j1", "status": "FAILED", "worker_type": "GVISOR_WORKER",
+                             "error": "retries exhausted"})
+
+    def test_every_test_outcome_carries_cpu_ms_and_an_optional_reason(self):
+        report = ExecutionReport("j1", "python", "RUN_CODE", "TLE", "Time Limit Exceeded", test_results=[
+            TestCaseResult(0, TestStatus.PASSED, cpu_ms=12),
+            TestCaseResult(1, TestStatus.TIMEOUT, cpu_ms=1003, reason="cpu time limit exceeded")])
+        outcomes = json.loads(report.to_json())["test_results"]
+        self.assertEqual([(t["cpu_ms"], t["reason"]) for t in outcomes],
+                         [(12, None), (1003, "cpu time limit exceeded")])
 
 
 if __name__ == "__main__":
