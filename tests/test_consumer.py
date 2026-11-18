@@ -30,8 +30,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def b64(s): return base64.b64encode(s.encode()).decode()
 
 
-def job_body(job_id):
-    return json.dumps({
+def job_body(job_id, **extra):
+    return json.dumps({**extra,
         "jobId": job_id, "language": "python",
         "userCode": b64("def add(a,b):\n    return a+b\n"),
         "driverCode": b64("from solution import add\na,b=map(int,input().split())\nprint(add(a,b))\n"),
@@ -133,6 +133,17 @@ class TestPublishing(ConsumerCase):
         self.assertNotIn("stream_id", sent)                 # Redis stays on the consumer's side
         await until(lambda: self.pending() == 0 and self.r.xlen(self.config.redis.stream_key) == 0)
         self.assertTrue(self.r.exists(self.config.redis.heartbeat_key))
+
+    async def test_the_checker_reaches_the_executor_and_per_test_fields_reach_the_backend(self):
+        outcome = {"index": 0, "status": "FAILED", "cpu_ms": 7, "reason": "answer line differs"}
+        self.stubs[0].reply = lambda job: {"status": "COMPLETED", "report": {
+            "execution_id": job["job_id"], "status_code": "WA", "failed_testcase": outcome}}
+        checker = {"mode": "float", "absEpsilon": 0.001}
+        self.submit(job_body("job-checker", checker=checker))
+        result = await self.result("job-checker")
+
+        self.assertEqual(self.stubs[0].jobs[0]["checker"], checker)
+        self.assertEqual(json.loads(result["execution_report"])["failed_testcase"], outcome)
 
     async def test_an_executor_worker_failure_is_published_failed_with_its_error(self):
         self.stubs[0].reply = lambda job: {"status": "FAILED", "error": "Language 'cobol' is not supported"}

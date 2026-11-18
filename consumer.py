@@ -33,9 +33,9 @@ from redis_io import RedisTransport
 
 logger = logging.getLogger(__name__)
 
-# One report: up to 50 test cases, each echoing its input plus capped stdout
-# and stderr.
-# ponytail: up to 256 MiB buffered per slot; size it from ticket 15's input caps.
+# One report: up to 50 test cases echoing their input and expected output (48 MiB
+# at most) plus capped stdout and stderr (25 MiB), JSON-escaped at up to 2x.
+# ponytail: up to 256 MiB buffered per slot.
 MAX_RESPONSE_BYTES = 256 * 1024 * 1024
 # `ready` is answered without waiting for a job, so a slow answer means a sick
 # executor. It delays the beat, so it stays well inside the heartbeat TTL.

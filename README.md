@@ -10,7 +10,15 @@ before, apart from the additive fields and the `worker_type` rename below.
 - **Submissions**: consumed from `stream:pending-submissions` (group `workers`).
   Entry field `body` = JSON `{jobId, language, userCode(b64), driverCode(b64),
   task, timeLimit(CPU-ms), memoryLimit(MB), testCases:[{input,expectedOutput}],
-  slowCode?, hogCode?}`.
+  slowCode?, hogCode?, checker?}`. `checker` = `{mode: exact|tokens|float,
+  absEpsilon?, relEpsilon?}` (epsilons default to 1e-6) compares the answer
+  line; without it the comparison is exact. A job over a worker cap (5000 ms,
+  128 MB, 50 test cases, 256 KiB each of user and driver code, 16 MiB of input
+  per test case, 48 MiB of input plus expected output) or with an unknown
+  checker is published `FAILED` with an `error` naming the cap; nothing is clamped.
+- **Test outcomes** (in `test_results` / `failed_testcase`): each carries
+  `cpu_ms`, and each that didn't pass a `reason` (`exit code 1`,
+  `signal SIGSEGV`, `forbidden syscall`, `cpu time limit exceeded`, ...).
 - **Results**: XADD'd to `stream:execution-results`. Entry field `body` = JSON
   `{job_id, status: COMPLETED|FAILED, worker_type: "GVISOR_WORKER",
   execution_report: <JSON string, COMPLETED only>, error?: <string, FAILED only>}`.

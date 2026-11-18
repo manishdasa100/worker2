@@ -53,7 +53,7 @@ class ExecutorContainer:
              "-v", f"{self.dir}:/run/executor", *self.docker_args, IMAGE],
             check=True, capture_output=True, text=True).stdout.strip()
         deadline = time.monotonic() + STARTUP_TIMEOUT_S
-        while not os.path.exists(self.socket):
+        while not os.access(self.socket, os.W_OK):     # bound, then chmod'ed for us
             if time.monotonic() > deadline or not self._running():
                 logs = self.logs()
                 self.__exit__()

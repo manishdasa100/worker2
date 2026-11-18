@@ -65,11 +65,16 @@ class SandboxConfig:
 
 @dataclass
 class ExecutionConfig:
-    default_time_limit_ms: int = 5000     # Max CPU-ms budget per test case (clamps request)
-    default_memory_limit: int = 128       # MB per sandbox (clamps request)
+    default_time_limit_ms: int = 5000     # Max CPU-ms budget per test case (a job over it fails)
+    default_memory_limit: int = 128       # Max MB budget per sandbox (a job over it fails)
     max_output_bytes: int = 262144        # 256 KB output cap
     max_output_lines: int = 5000
     max_testcases: int = 50               # Worker backstop on job duration
+    # Payload caps, from judgebox's. A job over any of them is a worker failure.
+    max_user_code_bytes: int = 256 * 1024
+    max_driver_code_bytes: int = 256 * 1024
+    max_input_bytes: int = 16 * 1024 * 1024        # one test case's input
+    max_total_input_bytes: int = 48 * 1024 * 1024  # every test case's input plus expected output
 
     # --- Sandboxed compilation (NEW in worker2) ---
     # The compiler runs inside a jail with only the toolchain + code dir

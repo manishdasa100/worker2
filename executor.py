@@ -36,8 +36,9 @@ from selftest import not_ready, self_test
 
 logger = logging.getLogger("executor")
 
-# Worker caps on payload sizes come later (ticket 15); this only bounds one read.
-MAX_REQUEST_BYTES = 64 * 1024 * 1024
+# Bounds one read: a job at the payload caps (config.py: 48 MiB of test data,
+# 2 x 256 KiB of code), JSON-escaped at up to 2x. Bigger fails as too large.
+MAX_REQUEST_BYTES = 128 * 1024 * 1024
 SELF_TEST_INTERVAL_S = int(os.environ.get("SELF_TEST_INTERVAL_S", 600))
 
 

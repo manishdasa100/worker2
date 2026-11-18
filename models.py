@@ -7,7 +7,8 @@ except for the spec's additive changes and the worker_type rename:
   Inbound (submission stream entry `body` field, JSON):
     {"jobId", "language", "userCode"(b64), "driverCode"(b64), "task",
      "timeLimit"(CPU-ms), "memoryLimit"(MB), "testCases":[{input,expectedOutput}],
-     "slowCode"(b64, CALIBRATE), "hogCode"(b64, CALIBRATE)}
+     "slowCode"(b64, CALIBRATE), "hogCode"(b64, CALIBRATE),
+     "checker": {"mode": exact|tokens|float, "absEpsilon"?, "relEpsilon"?}}   # optional
 
   Outbound (result stream entry `body` field, JSON):
     {"job_id", "status": COMPLETED|FAILED, "worker_type": "GVISOR_WORKER",
@@ -66,6 +67,7 @@ class ExecutionRequest:
     stream_id: str = ""                    # Redis entry ID (for XACK + XDEL)
     slow_code: str = ""                    # CALIBRATE: too-slow adversary (time gap check)
     hog_code: str = ""                     # CALIBRATE: memory-hungry adversary (mem gap check)
+    checker: Optional[dict] = None         # {mode, absEpsilon?, relEpsilon?}; None is exact
 
 
 @dataclass
@@ -88,6 +90,8 @@ class TestCaseResult:
     runtime_ms: int = 0
     memory_mb: int = 0
     error_message: Optional[str] = None
+    reason: Optional[str] = None           # Why it didn't pass: "exit code 1", "signal SIGSEGV", ...
+    cpu_ms: int = 0
 
 
 @dataclass
@@ -132,7 +136,7 @@ def parse_job_message(body: str, stream_id: str = "") -> ExecutionRequest:
 
     camelCase is the backend's shape; snake_case timeLimit/memoryLimit are
     accepted for compatibility. timeLimit is CPU-ms, memoryLimit is MB; either
-    may be null/absent (defaults apply, and the judge clamps to worker caps).
+    may be null/absent (defaults apply). The judge validates limits and checker.
     Raises KeyError/ValueError/TypeError on a malformed body.
     """
     data = json.loads(body)
@@ -158,6 +162,7 @@ def parse_job_message(body: str, stream_id: str = "") -> ExecutionRequest:
         stream_id=stream_id,
         slow_code=safe_base64_decode(slow_code) if slow_code else "",
         hog_code=safe_base64_decode(hog_code) if hog_code else "",
+        checker=data.get("checker"),
     )
 
 

@@ -177,6 +177,11 @@ class TestVerdictMatrix(Verdicts):
                         self.assertNotIn(OOM_MARKERS[language], stderr)
                     if case == "CE":
                         self.assertTrue(report["compile_error"])
+                    elif case == "ACC":
+                        self.assertIsNone(report["failed_testcase"])
+                    else:
+                        self.assertTrue(report["failed_testcase"]["reason"])
+                        self.assertIsInstance(report["failed_testcase"]["cpu_ms"], int)
 
 
 class TestCpp(Verdicts):
@@ -196,11 +201,13 @@ class TestCpp(Verdicts):
     def test_segfault_names_the_signal(self):
         report = self.verdict(executor.run_job(**job("cpp", MATRIX["cpp"][1]["RE"], CPP_DRIVER)), "RE")
         self.assertIn("SIGSEGV", report["runtime_error"])
+        self.assertEqual(report["failed_testcase"]["reason"], "signal SIGSEGV")
 
     def test_forbidden_syscall_is_a_runtime_error(self):
         solution = "#include <sched.h>\nint f() { unshare(0); return 42; }\n"
         report = self.verdict(executor.run_job(**job("cpp", solution, CPP_DRIVER)), "RE")
         self.assertIn("forbidden syscall", report["runtime_error"])
+        self.assertEqual(report["failed_testcase"]["reason"], "forbidden syscall")
 
     def test_recursive_dfs_of_depth_100000_fits_a_128_mb_budget(self):
         # ~300 bytes a frame: about 30 MB of stack, far past the usual 8 MB default.
@@ -351,6 +358,10 @@ class TestPythonVerdicts(Verdicts):
                                                             test_cases=cases)), "WA")
         self.assertEqual([t["status"] for t in report["test_results"]], ["PASSED", "FAILED"])
         self.assertEqual(report["test_results"][1]["actual_output"], "2")
+        self.assertIsNone(report["test_results"][0]["reason"])
+        self.assertTrue(report["test_results"][1]["reason"])
+        for outcome in report["test_results"]:
+            self.assertIsInstance(outcome["cpu_ms"], int)
 
     def test_wrong_answer_stops_submit(self):
         report = self.verdict(executor.run_job(**python_job(
@@ -361,11 +372,13 @@ class TestPythonVerdicts(Verdicts):
         report = self.verdict(executor.run_job(**python_job(
             "import sys\ndef f():\n    sys.exit(255)\n")), "RE")
         self.assertIn("exit code 255", report["runtime_error"])
+        self.assertEqual(report["failed_testcase"]["reason"], "exit code 255")
 
     def test_exit_139_is_an_exit_code_not_a_signal(self):
         report = self.verdict(executor.run_job(**python_job(
             "import sys\ndef f():\n    sys.exit(139)\n")), "RE")
         self.assertIn("exit code 139", report["runtime_error"])
+        self.assertEqual(report["failed_testcase"]["reason"], "exit code 139")
 
     def test_forbidden_syscall_is_a_runtime_error(self):
         report = self.verdict(executor.run_job(**python_job(
@@ -380,7 +393,8 @@ class TestPythonVerdicts(Verdicts):
         # startup costs, so the kill lands in the loop. No driver timing: runtime is CPU time.
         report = self.verdict(executor.run_job(**python_job(
             "def f():\n    while True: pass\n", time_limit=200)), "TLE")
-        self.assertIn("cpu time", report["failed_testcase"]["error_message"])
+        self.assertEqual(report["failed_testcase"]["reason"], "cpu time limit exceeded")
+        self.assertIsNone(report["failed_testcase"]["error_message"])
         self.assertLessEqual(report["runtime_ms"], 900)   # at most ~300 ms past the limit
 
     def test_sleeping_is_a_wall_time_limit(self):
@@ -389,7 +403,7 @@ class TestPythonVerdicts(Verdicts):
         report = self.verdict(executor.run_job(**python_job(
             "import time\ndef f():\n    time.sleep(30)\n", time_limit=333)), "TLE")
         self.assertLess(time.monotonic() - started, 4)
-        self.assertIn("wall time", report["failed_testcase"]["error_message"])
+        self.assertEqual(report["failed_testcase"]["reason"], "wall time limit exceeded")
 
     def test_finishing_just_under_the_enforced_cpu_limit_is_accepted(self):
         # 500 ms x 3 = 1500 ms enforced; leave room for interpreter startup.
@@ -434,6 +448,52 @@ class TestPythonVerdicts(Verdicts):
             "import sys\ndef f():\n    while True: sys.stderr.write('e' * 65536)\n")), "OLE")
 
 
+ANSWER_DRIVER = "import sys\nprint(sys.stdin.read())\n"   # the input is the answer line
+
+
+class TestCheckers(Verdicts):
+    def judge(self, answer, expected, checker=None):
+        extra = {} if checker is None else {"checker": checker}
+        return executor.run_job(**python_job("", ANSWER_DRIVER, test_cases=[
+            {"input": answer, "expectedOutput": expected}], **extra))
+
+    def test_without_a_checker_the_answer_line_must_match_exactly(self):
+        self.verdict(self.judge("  1 2  \n", "1 2"), "ACC")    # the answer line is stripped
+        self.verdict(self.judge("1  2", "1 2"), "WA")
+        self.verdict(self.judge("0.30000000000000004", "0.3"), "WA")
+
+    def test_exact_mode_is_the_default(self):
+        self.verdict(self.judge("1  2", "1 2", {"mode": "exact"}), "WA")
+
+    def test_tokens_ignores_whitespace_between_tokens(self):
+        self.verdict(self.judge("1 \t 2", "1 2", {"mode": "tokens"}), "ACC")
+        self.verdict(self.judge("1 2 3", "1 2", {"mode": "tokens"}), "WA")
+
+    def test_float_accepts_within_the_default_epsilon(self):
+        self.verdict(self.judge("0.30000000000000004", "0.3", {"mode": "float"}), "ACC")
+        self.verdict(self.judge("yes 1.0000001", "yes 1", {"mode": "float"}), "ACC")
+
+    def test_float_rejects_outside_the_epsilon(self):
+        self.verdict(self.judge("0.3001", "0.3", {"mode": "float"}), "WA")
+        self.verdict(self.judge("no 0.3", "yes 0.3", {"mode": "float"}), "WA")
+        self.verdict(self.judge("nan", "nan", {"mode": "float", "absEpsilon": 1}), "ACC")   # same token
+        self.verdict(self.judge("0.31", "0.3", {"mode": "float", "absEpsilon": 0.001, "relEpsilon": 0}), "WA")
+
+    def test_float_epsilons_widen_the_tolerance(self):
+        self.verdict(self.judge("0.31", "0.3", {"mode": "float", "absEpsilon": 0.02}), "ACC")
+        self.verdict(self.judge("1050", "1000", {"mode": "float", "relEpsilon": 0.1}), "ACC")
+
+    def test_unknown_mode_is_a_worker_failure_naming_it(self):
+        response = self.judge("1", "1", {"mode": "lines"})
+        self.assertEqual(response["status"], "FAILED", response)
+        self.assertIn("lines", response["error"])
+
+    def test_a_negative_epsilon_is_a_worker_failure(self):
+        response = self.judge("1", "1", {"mode": "float", "absEpsilon": -1})
+        self.assertEqual(response["status"], "FAILED", response)
+        self.assertIn("absEpsilon", response["error"])
+
+
 class TestWorkerFailures(unittest.TestCase):
     def assertWorkerFailure(self, response):
         self.assertEqual(response["status"], "FAILED", response)
@@ -452,6 +512,28 @@ class TestWorkerFailures(unittest.TestCase):
         response = executor.run_job(**python_job(ADD, ADD_DRIVER, test_cases=CASES * 26))   # 52 > 50
         self.assertWorkerFailure(response)
         self.assertIn("52", response["error"])
+        self.assertIn("50", response["error"])
+
+    def test_out_of_range_limits_are_not_clamped(self):
+        for limits, cap in (({"time_limit": 6000}, "5000"), ({"time_limit": 0}, "5000"),
+                            ({"memory_limit": 129}, "128"), ({"memory_limit": 0}, "128")):
+            with self.subTest(**limits):
+                response = executor.run_job(**python_job(ADD, ADD_DRIVER, test_cases=CASES, **limits))
+                self.assertWorkerFailure(response)
+                self.assertIn(cap, response["error"])
+
+    def test_oversize_code_and_input(self):
+        big = "#" * (256 * 1024) + "\n"     # one byte over judgebox's 256 KiB
+        case = {"input": "x" * (16 * 1024 * 1024 + 1), "expectedOutput": "1"}
+        half = {"input": "x" * (12 * 1024 * 1024), "expectedOutput": "1"}       # 4 of them: 48 MiB + 4
+        for name, job, cap in (("user code", python_job(ADD + big, ADD_DRIVER, test_cases=CASES), "262144"),
+                               ("driver code", python_job(ADD, ADD_DRIVER + big, test_cases=CASES), "262144"),
+                               ("input", python_job(ADD, ADD_DRIVER, test_cases=[case]), "16777216"),
+                               ("total", python_job(ADD, ADD_DRIVER, test_cases=[half] * 4), "50331648")):
+            with self.subTest(name):
+                response = executor.run_job(**job)
+                self.assertWorkerFailure(response)
+                self.assertIn(cap, response["error"])
 
     def test_unsupported_language(self):
         job = python_job(ADD, ADD_DRIVER, test_cases=CASES)
